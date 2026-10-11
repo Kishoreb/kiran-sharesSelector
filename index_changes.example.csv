@@ -1,0 +1,18 @@
+# EXAMPLE ONLY: these are made-up symbols, not real index changes. Do not use as data.
+# Make your own copy (e.g. index_changes.csv) with real rows, one file per index.
+#
+# date,symbol,action
+#   date   = EFFECTIVE date, the first trading day the change applies.
+#            NSE says "effective from September 30, 2026 (close of September 29, 2026)" -> 2026-09-30
+#   symbol = NSE ticker (press releases list company names; look up the ticker)
+#   action = ADD or REMOVE
+#
+# Source: NSE Indices "Replacements in indices" press releases on niftyindices.com
+# (Press_Release/ind_prsDDMMYYYY.pdf), normally effective the last working day of March and September.
+# Work BACKWARDS from today's list: for each release, add a row for every company added and removed
+# in the index you are testing (Nifty 50 / 100 / 200 / 500 sections are listed separately).
+# The tool checks your rows against today's list and warns about anything that doesn't add up.
+2026-09-30,EXAMPLEIN,ADD
+2026-09-30,EXAMPLEOUT,REMOVE
+2026-03-31,EXAMPLEIN2,ADD
+2026-03-31,EXAMPLEOUT2,REMOVE
