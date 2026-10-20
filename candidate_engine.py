@@ -1,16 +1,16 @@
 """
 Candidate Engine.
 
-Runs a universe of symbols through one or more strategies, applies the
-pre-trade filters, sizes each qualifying setup via the Risk Engine, and
-ranks the results. This is the "what currently meets my rules, sized for
-my capital" view — not a prediction of what will perform best.
+Runs a universe of symbols through one or more strategies, sizes each
+qualifying setup via the Risk Engine, and ranks the results. This is the
+"what currently meets my rules, sized for my capital" view — not a
+prediction of what will perform best.
 """
 
 from dataclasses import dataclass, asdict
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional
 
-from data import fetch_history
+from data import fetch_history, fetch_market_cap_cr, classify_market_cap
 from strategies import Strategy
 from risk import RiskEngine
 from filters import TradeFilters, ResultsCalendar
@@ -31,12 +31,32 @@ class Candidate:
     risk_amount: float
     reason: str
     sector: str = "Unknown"
+    market_cap_cr: float = 0.0
+    cap_class: str = "Unknown"
+    # Fundamentals (section 1) -- filled in by the screener only when --fundamentals is on
+    fund_status: str = ""          # pass / fail / n/a, or "" when not run
+    fund_notes: str = ""           # e.g. "failed: roce,de | n/a: icr | exempt: roce,de,icr"
+    roce_pct: Optional[float] = None
+    roe_avg_pct: Optional[float] = None
+    debt_equity: Optional[float] = None
+    pe: Optional[float] = None
+    peg: Optional[float] = None
+    fund_passed: int = 0           # fundamental rules passed (n/a and exempt rules are NOT counted)
+    fund_evaluated: int = 0        # fundamental rules actually evaluated
+    cond_met: str = ""             # strategy/technical conditions that were true
+    cond_missed: str = ""          # conditions that were false (non-gating ones, e.g. volume)
     over_sector_cap: bool = False
     error: str = ""
-    rel_strength: Optional[float] = None   # 63-day return minus Nifty's, % points
-    stop_pct: float = 0.0                  # (entry - stop) / entry, %
-    traded_value_cr: float = 0.0           # 20-day avg traded value, Rs crore
-    regime_ok: Optional[bool] = None       # None = not checked / unknown
+    thesis: str = ""               # templated one-liner, built after ranking (see build_thesis)
+    rel_strength: Optional[float] = None   # 63-day return minus index return, % points (None = unknown)
+    stop_pct: float = 0.0                  # (entry - stop) / entry in %, tighter is better
+    # Ownership (section 2) and qualitative layer (section 4) -- filled in by the screener when enabled
+    promoter_pct: Optional[float] = None
+    pledged_pct: Optional[float] = None
+    sentiment_30d: Optional[float] = None
+    sentiment_trend: Optional[float] = None
+    qual_severity: str = ""                # '', 'Medium' or 'High' governance red-flag severity
+    qual_flags: str = ""
 
     @property
     def target_gain_pct(self) -> float:
@@ -47,23 +67,17 @@ class Candidate:
 
 class CandidateEngine:
     def __init__(self, strategies: List[Strategy], risk_engine: RiskEngine, sector_map: Optional[dict] = None,
-                 filters: Optional[TradeFilters] = None, benchmark: Optional[Benchmark] = None,
-                 results_calendar: Optional[ResultsCalendar] = None, regime_mode: str = "flag"):
-        """
-        regime_mode: "off"   -- ignore the market regime
-                     "flag"  -- keep candidates, mark regime_ok=False when the index is below its trend
-                     "block" -- drop all candidates while the index is below its trend
-        Everything dropped by a filter is recorded in self.rejected as
-        (symbol, strategy, reason_key) so nothing disappears silently.
-        """
+                 fetch_market_cap: bool = True, benchmark: Optional[Benchmark] = None,
+                 trade_filters: Optional[TradeFilters] = None,
+                 results_calendar: Optional[ResultsCalendar] = None):
+        self.fetch_market_cap = fetch_market_cap
         self.strategies = strategies
         self.risk_engine = risk_engine
         self.sector_map = sector_map or {}
-        self.filters = filters
-        self.benchmark = benchmark
+        self.benchmark = benchmark                  # for relative strength (ranking tiebreaker)
+        self.trade_filters = trade_filters          # same pre-trade filters the backtester applies
         self.results_calendar = results_calendar
-        self.regime_mode = regime_mode
-        self.rejected: List[Tuple[str, str, str]] = []
+        self.skipped: Dict[str, int] = {}           # filter reason -> signals dropped
 
     def screen_symbol(self, symbol: str) -> List[Candidate]:
         results = []
@@ -74,43 +88,37 @@ class CandidateEngine:
                                target=0, quantity=0, capital_required=0, risk_amount=0, reason="", error=str(e))]
 
         i = len(df) - 1
-        regime = None
-        if self.benchmark is not None and self.regime_mode != "off":
-            regime = self.benchmark.is_bullish(df.index[i].date())
-
+        cap_cr = None
+        cap_fetched = False
         for strat in self.strategies:
             sig = strat.signal(df, i)
             if not sig.enter:
                 continue
-            sym = symbol.upper()
-            if self.regime_mode == "block" and regime is False:
-                self.rejected.append((sym, strat.name, "regime"))
-                continue
-            if self.filters is not None:
-                reason = self.filters.check(df, i, sig.entry, sig.stop, symbol=sym,
-                                            calendar=self.results_calendar)
+            if self.trade_filters is not None:
+                reason = self.trade_filters.check(df, i, sig.entry, sig.stop, symbol=symbol,
+                                                  calendar=self.results_calendar)
                 if reason:
-                    self.rejected.append((sym, strat.name, reason))
+                    self.skipped[reason] = self.skipped.get(reason, 0) + 1
                     continue
             target = self.risk_engine.target_price(sig.entry, sig.stop)
             size = self.risk_engine.position_size(sig.entry, sig.stop)
             if size.quantity <= 0:
-                self.rejected.append((sym, strat.name, "zero_quantity"))
                 continue
-            if self.risk_engine.undersized(size.risk_amount):
-                self.rejected.append((sym, strat.name, "undersized"))
-                continue
-            tv = float(df["traded_value20"].iloc[i]) if "traded_value20" in df.columns else float("nan")
+            # Market cap is a network call, so only fetch for symbols that qualify (once per symbol).
+            if self.fetch_market_cap and not cap_fetched:
+                cap_cr = fetch_market_cap_cr(symbol)
+                cap_fetched = True
             results.append(Candidate(
-                symbol=sym, strategy=strat.name, score=sig.score, total=sig.total,
+                symbol=symbol.upper(), strategy=strat.name, score=sig.score, total=sig.total,
                 entry=round(sig.entry, 2), stop=round(sig.stop, 2), target=target,
                 quantity=size.quantity, capital_required=size.capital_required,
                 risk_amount=size.risk_amount, reason=sig.reason,
-                sector=self.sector_map.get(sym, "Unknown"),
+                sector=self.sector_map.get(symbol.upper(), "Unknown"),
+                market_cap_cr=cap_cr or 0.0, cap_class=classify_market_cap(cap_cr),
+                cond_met=",".join(k for k, v in (sig.conditions or {}).items() if v),
+                cond_missed=",".join(k for k, v in (sig.conditions or {}).items() if not v),
                 rel_strength=self.benchmark.relative_strength(df, i) if self.benchmark is not None else None,
                 stop_pct=round((sig.entry - sig.stop) / sig.entry * 100, 2),
-                traded_value_cr=round(tv / 1e7, 1) if tv == tv else 0.0,
-                regime_ok=regime,
             ))
         return results
 
@@ -119,7 +127,6 @@ class CandidateEngine:
         for idx, sym in enumerate(symbols, 1):
             if progress:
                 print(f"  [{idx}/{len(symbols)}] {sym}...", end=" ")
-            n_rejected_before = len(self.rejected)
             results = self.screen_symbol(sym)
             errored = [r for r in results if r.error]
             passed = [r for r in results if not r.error]
@@ -128,29 +135,113 @@ class CandidateEngine:
                     print(f"skipped ({errored[0].error})")
                 elif passed:
                     print(", ".join(f"{c.strategy}:{c.score}/{c.total}" for c in passed))
-                elif len(self.rejected) > n_rejected_before:
-                    print(f"signal filtered out ({self.rejected[-1][2]})")
                 else:
                     print("no signal")
             all_candidates.extend(passed)
         return all_candidates
 
     @staticmethod
-    def rank(candidates: List[Candidate]) -> List[Candidate]:
+    def points(c: Candidate, fund_weight: float = 1.0) -> float:
         """
-        Ranks by score first (more confirming conditions), then by relative
-        strength vs the index (stronger first), then by tighter stop.
+        Ranking points = technical conditions true + fund_weight x fundamental
+        rules passed. Fundamentals only count when they were run (fund_status
+        set). A rule that is n/a or exempt earns nothing, so missing data
+        slightly lowers a stock's rank rather than being treated as a pass.
+        With fundamentals off, this is exactly the old technical score.
+        """
+        return c.score + (fund_weight * c.fund_passed if c.fund_status else 0)
 
-        (Reward:risk used to be the tiebreaker, but the target is a fixed
-        multiple of the stop distance so it was identical for every
-        candidate.) Candidates with no relative-strength figure sort after
-        those that have one. Transparent and rule-based, not a prediction.
+    @staticmethod
+    def rank(candidates: List[Candidate], fund_weight: float = 1.0) -> List[Candidate]:
+        """
+        Ranks by combined points (technical + fundamental), then by relative
+        strength vs the index (unknown ranks last), then by tighter stop.
+        Same ordering the backtester uses when several entries compete for
+        one slot. A transparent, rule-based ranking, not a prediction.
         """
         def key(c: Candidate):
             rs = c.rel_strength if c.rel_strength is not None else float("-inf")
-            return (c.score, rs, -c.stop_pct)
+            return (CandidateEngine.points(c, fund_weight), rs, -c.stop_pct)
 
         return sorted(candidates, key=key, reverse=True)
+
+    _LABELS = {
+        "price_above_20ema": "above 20-EMA", "price_above_50ema": "above 50-EMA",
+        "ema50_sloping_up": "rising 50-EMA", "pullback_and_reclaim": "pullback and reclaim of the 20-EMA",
+        "volume_confirmed": "volume above average", "has_valid_stop": "valid stop",
+        "broke_above_recent_range": "broke its recent range", "strong_volume": "strong volume",
+        "closed_near_high": "closed near the day's high", "liquidity_ok": "liquid",
+        "above_sma200": "above 200-SMA", "near_52w_high": "near 52-week high",
+    }
+    _SHOWN = ["pullback_and_reclaim", "broke_above_recent_range", "ema50_sloping_up", "above_sma200",
+              "near_52w_high", "volume_confirmed", "strong_volume", "liquidity_ok"]
+
+    @staticmethod
+    def build_thesis(c: Candidate) -> str:
+        """
+        Templated one-line summary assembled only from fields already computed
+        for the candidate -- no LLM, no new data. It restates why the rules
+        fired and what to watch; it is not a recommendation.
+        """
+        L = CandidateEngine._LABELS
+        met = [x for x in c.cond_met.split(",") if x]
+        missed = [x for x in c.cond_missed.split(",") if x]
+
+        why = [L[k] for k in CandidateEngine._SHOWN if k in met]
+        head = f"{c.symbol}"
+        tag = ", ".join(x for x in (f"{c.cap_class} cap" if c.cap_class != "Unknown" else "",
+                                    c.sector if c.sector != "Unknown" else "") if x)
+        if tag:
+            head += f" ({tag})"
+        parts = [f"{head}: {c.reason}" + (f" - {', '.join(why)}" if why else "")]
+
+        risk = c.entry - c.stop
+        stop_pct = round(risk / c.entry * 100, 1) if c.entry else 0
+        rr = round((c.target - c.entry) / risk, 1) if risk > 0 else 0
+        parts.append(f"Entry {c.entry}, stop {c.stop} (-{stop_pct}%), target {c.target} (+{c.target_gain_pct}%), "
+                     f"R:R {rr}, risk Rs {c.risk_amount}")
+
+        if c.rel_strength is not None:
+            parts[-1] += f", {c.rel_strength:+.1f} pts vs index over 63 days"
+        if c.fund_status:
+            vals = []
+            if c.roce_pct is not None:
+                vals.append(f"ROCE {c.roce_pct}%")
+            if c.roe_avg_pct is not None:
+                vals.append(f"ROE {c.roe_avg_pct}%")
+            if c.debt_equity is not None:
+                vals.append(f"D/E {c.debt_equity}")
+            if c.pe is not None:
+                vals.append(f"P/E {c.pe}")
+            if c.peg is not None:
+                vals.append(f"PEG {c.peg}")
+            f = f"Fundamentals {c.fund_status} ({c.fund_passed}/{c.fund_evaluated} rules)"
+            parts.append(f + (": " + ", ".join(vals) if vals else ""))
+
+        if c.promoter_pct is not None:
+            own = f"Promoter {c.promoter_pct}%"
+            if c.pledged_pct is not None:
+                own += f", {c.pledged_pct}% pledged"
+            parts.append(own)
+        if c.sentiment_30d is not None:
+            tr = f", trend {c.sentiment_trend:+.2f}" if c.sentiment_trend is not None else ""
+            parts.append(f"News sentiment (30d) {c.sentiment_30d:+.2f}{tr}")
+
+        watch = []
+        if c.qual_flags:
+            watch.append("governance flags: " + c.qual_flags)
+        if c.over_sector_cap:
+            watch.append("over your sector cap")
+        if c.fund_status and "failed:" in c.fund_notes:
+            watch.append(c.fund_notes.split("|")[0].strip().replace("failed:", "failed fundamentals:"))
+        if c.fund_status and "n/a:" in c.fund_notes:
+            watch.append("some fundamentals unavailable")
+        soft = [L.get(k, k) for k in missed if k in ("volume_confirmed", "closed_near_high")]
+        if soft:
+            watch.append("not confirmed: " + ", ".join(soft))
+        if watch:
+            parts.append("Watch: " + "; ".join(watch))
+        return ". ".join(parts) + "."
 
     @staticmethod
     def flag_sector_concentration(ranked_candidates: List[Candidate], max_per_sector: int = 2) -> dict:

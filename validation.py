@@ -116,6 +116,8 @@ def make_runner(symbol_data: Dict[str, pd.DataFrame], bench_df: Optional[pd.Data
         elif p["strategy"] == "breakout":
             skw["breakout_lookback"] = p["breakout_lookback"]
             skw["volume_multiple"] = p["volume_multiple"]
+        if p.get("tech_filters") is not None:      # section-3 TechnicalFilters, supplied by screener.py
+            skw["filters"] = p["tech_filters"]
         strategy = STRATEGIES[p["strategy"]](**skw)
         risk = RiskEngine(p["capital"], p["risk_pct"], p["heat_ceiling"], p["max_positions"], p["reward_risk"],
                           min_risk_fraction=p["min_risk_fraction"])

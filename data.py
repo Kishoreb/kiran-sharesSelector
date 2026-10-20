@@ -14,7 +14,7 @@ except ImportError:
 
 def to_yf_symbol(sym: str) -> str:
     sym = sym.strip().upper()
-    if sym.startswith("^"):          # index symbols such as ^NSEI are used as-is
+    if sym.startswith("^"):          # index ticker such as ^NSEI: no exchange suffix
         return sym
     if not sym.endswith(".NS") and not sym.endswith(".BO"):
         sym += ".NS"
@@ -22,33 +22,26 @@ def to_yf_symbol(sym: str) -> str:
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adds the indicator columns every strategy / filter relies on:
-    ema20, ema50, vol_avg20, high_20, low_20, atr14 (Wilder), and
-    traded_value20 (20-day average of Close x Volume, in rupees).
-    """
+    """Indicator columns every strategy, filter and the backtester rely on.
+    All are trailing windows including the current bar, so no lookahead."""
+    df = df.copy()
     df["ema20"] = df["Close"].ewm(span=20, adjust=False).mean()
     df["ema50"] = df["Close"].ewm(span=50, adjust=False).mean()
     df["vol_avg20"] = df["Volume"].rolling(20).mean()
     df["high_20"] = df["High"].rolling(20).max()
     df["low_20"] = df["Low"].rolling(20).min()
-
-    prev_close = df["Close"].shift(1)
-    true_range = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - prev_close).abs(),
-        (df["Low"] - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    df["atr14"] = true_range.ewm(alpha=1 / 14, adjust=False).mean()
-    df["traded_value20"] = (df["Close"] * df["Volume"]).rolling(20).mean()
+    df["sma200"] = df["Close"].rolling(200).mean()
+    df["high_252"] = df["High"].rolling(252, min_periods=200).max()   # ~52-week high
+    df["avg_value20"] = (df["Close"] * df["Volume"]).rolling(20).mean()  # avg daily traded value, Rs
+    df["traded_value20"] = df["avg_value20"]                          # name used by filters.py
     return df
 
 
 def fetch_history(symbol: str, period: str = "2y", interval: str = "1d") -> pd.DataFrame:
     """
     Returns a DataFrame with Open/High/Low/Close/Volume, indexed by date,
-    plus the indicator columns from add_indicators() pre-computed since
-    every strategy, filter and the backtester need them.
+    plus ema20/ema50/vol_avg20 columns pre-computed since every strategy
+    and the backtester need them.
     """
     if yf is None:
         raise ImportError("yfinance not installed. Run: pip install -r requirements.txt")
@@ -59,3 +52,33 @@ def fetch_history(symbol: str, period: str = "2y", interval: str = "1d") -> pd.D
         raise ValueError(f"no price data returned for {yf_symbol}")
 
     return add_indicators(df)
+
+
+# Market-cap bands from the shortlisting doc (Rs crore)
+LARGE_CAP_MIN_CR = 20000
+MID_CAP_MIN_CR = 5000
+
+
+def classify_market_cap(cap_cr):
+    if cap_cr is None or cap_cr <= 0:
+        return "Unknown"
+    if cap_cr > LARGE_CAP_MIN_CR:
+        return "Large"
+    if cap_cr >= MID_CAP_MIN_CR:
+        return "Mid"
+    return "Small"
+
+
+def fetch_market_cap_cr(symbol: str):
+    """
+    Current market cap in Rs crore from Yahoo, or None if unavailable.
+    This is a live snapshot only -- NOT point-in-time -- so it is used for
+    screening/labelling, never inside the backtester.
+    """
+    if yf is None:
+        return None
+    try:
+        cap = yf.Ticker(to_yf_symbol(symbol)).fast_info["market_cap"]
+        return round(float(cap) / 1e7, 1) if cap else None   # 1 crore = 1e7
+    except Exception:
+        return None

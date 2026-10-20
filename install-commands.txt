@@ -1,0 +1,9 @@
+
+
+pip install pdfplumber xlwt                  # xlwt writes .xls
+pip install pytesseract                      # only if the PDF has no text, plus the Tesseract program itself
+
+python cdsl_holdings_to_xls.py Kiran_2026-06.pdf
+python cdsl_holdings_to_xls.py Kiran_2026-06.pdf -o holdings.xls
+python cdsl_holdings_to_xls.py cas.pdf --password ABCDE1234F   # CDSL files are usually password-protected with your PAN
+

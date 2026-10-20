@@ -6,19 +6,50 @@ at df.iloc[:i+1] (today and earlier) so it can be used identically for live
 screening (i = last row) and backtesting (walking i forward through history)
 without any lookahead bias.
 
-Stop placement is configurable on every strategy:
-  stop_mode="structure"  (default) -- the strategy's own structural level
-                          (swing low / EMA / breakout level)
-  stop_mode="atr"        -- close - atr_mult x ATR(14)
+Every strategy takes two stop options:
+  stop_mode = "structure"  stop at a chart level below price (strategy specific)
+  stop_mode = "atr"        stop = close - atr_mult x ATR(14)
+atr_mult is ignored in structure mode.
 
 Add a new strategy by subclassing Strategy and registering it in STRATEGIES
 at the bottom of this file.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Optional
 
+import numpy as np
 import pandas as pd
+
+STOP_MODES = ("structure", "atr")
+
+
+@dataclass
+class TechnicalFilters:
+    """
+    Extra gates from the shortlisting doc (section 3), applied on top of
+    each strategy's own conditions. Each enabled filter adds one named
+    condition to the Signal (so it shows in score/total) AND must be true
+    for the entry to fire. Set a value to 0 / False to disable it.
+    Missing data (e.g. fewer than 200 bars) counts as NOT passing.
+    """
+    min_avg_value_cr: float = 1.0          # 20-day avg daily traded value floor, Rs crore
+    require_above_sma200: bool = True      # close > 200-day SMA
+    max_pct_from_52w_high: float = 20.0    # close within this % of the 52-week high
+
+    def conditions(self, df: pd.DataFrame, i: int) -> dict:
+        row = df.iloc[i]
+        out = {}
+        if self.min_avg_value_cr and self.min_avg_value_cr > 0:
+            v = row.get("avg_value20")
+            out["liquidity_ok"] = bool(pd.notna(v) and v >= self.min_avg_value_cr * 1e7)
+        if self.require_above_sma200:
+            sma = row.get("sma200")
+            out["above_sma200"] = bool(pd.notna(sma) and row["Close"] > sma)
+        if self.max_pct_from_52w_high and self.max_pct_from_52w_high > 0:
+            hi = row.get("high_252")
+            out["near_52w_high"] = bool(pd.notna(hi) and row["Close"] >= hi * (1 - self.max_pct_from_52w_high / 100))
+        return out
 
 
 @dataclass
@@ -40,31 +71,44 @@ class Signal:
         return len(self.conditions) if self.conditions else 0
 
 
+def atr(df: pd.DataFrame, i: int, n: int = 14) -> float:
+    """Average true range over the n bars ending at bar i (uses only bars <= i). NaN if too little data."""
+    lo = max(1, i - n + 1)
+    if i < 1 or lo > i:
+        return float("nan")
+    high = df["High"].to_numpy(dtype=float)[lo:i + 1]
+    low = df["Low"].to_numpy(dtype=float)[lo:i + 1]
+    prev = df["Close"].to_numpy(dtype=float)[lo - 1:i]
+    tr = np.maximum(high - low, np.maximum(np.abs(high - prev), np.abs(low - prev)))
+    return float(tr.mean()) if len(tr) else float("nan")
+
+
 class Strategy:
     name = "base"
     min_bars_required = 55  # enough history for 50-EMA + lookback windows
 
-    def __init__(self, stop_mode: str = "structure", atr_mult: float = 2.0):
-        if stop_mode not in ("structure", "atr"):
-            raise ValueError("stop_mode must be 'structure' or 'atr'")
+    def __init__(self, stop_mode: str = "structure", atr_mult: float = 2.0,
+                 filters: Optional[TechnicalFilters] = None):
+        if stop_mode not in STOP_MODES:
+            raise ValueError(f"stop_mode must be one of {STOP_MODES}, got '{stop_mode}'")
         self.stop_mode = stop_mode
         self.atr_mult = atr_mult
+        self.filters = filters
 
-    def _pick_stop(self, today: pd.Series, structure_levels: List[float]) -> Optional[float]:
-        """
-        structure mode: the tightest (highest) structural level that is
-        below today's close. atr mode: close - atr_mult x ATR14.
-        Returns None if no valid stop exists.
-        """
-        close = float(today["Close"])
+    def _filter_conditions(self, df: pd.DataFrame, i: int) -> dict:
+        return self.filters.conditions(df, i) if self.filters else {}
+
+    def _stop(self, df: pd.DataFrame, i: int, structure_levels) -> Optional[float]:
+        """The stop for an entry at today's close, or None if no valid stop (must be > 0 and < close)."""
+        close = float(df["Close"].iloc[i])
         if self.stop_mode == "atr":
-            atr = today["atr14"] if "atr14" in today.index else float("nan")
-            if pd.notna(atr) and atr > 0:
-                level = close - self.atr_mult * float(atr)
-                return float(level) if level > 0 else None
-            return None
-        candidates = [float(l) for l in structure_levels if l < close]
-        return max(candidates) if candidates else None
+            a = atr(df, i)
+            if not np.isfinite(a) or a <= 0:
+                return None
+            s = close - self.atr_mult * a
+            return float(s) if 0 < s < close else None
+        cands = [float(l) for l in structure_levels if l < close]
+        return max(cands) if cands else None
 
     def signal(self, df: pd.DataFrame, i: int) -> Signal:
         raise NotImplementedError
@@ -72,7 +116,7 @@ class Strategy:
     def trend_intact(self, df: pd.DataFrame, i: int) -> dict:
         """
         Checks whether the THESIS behind an already-open position still
-        holds — not whether today is a fresh entry trigger. Used by the
+        holds, not whether today is a fresh entry trigger. Used by the
         position monitor, not by screening/backtesting entries.
         """
         raise NotImplementedError
@@ -82,33 +126,36 @@ class PullbackTrendStrategy(Strategy):
     """
     Trend-following pullback/reclaim, per the swing framework:
     price above rising 20/50 EMA, pulled back to the 20-EMA, reclaimed it
-    on rising volume. Stop = tighter of recent swing low or the 50-EMA
-    (or an ATR stop, if stop_mode="atr").
+    on rising volume.
 
-    The pullback is the run of consecutive closes at/below the 20-EMA that
-    ends the day before the reclaim. It must last at least
-    `min_pullback_days` (a one-day dip is noise) and at most
-    `pullback_lookback` days (a longer stretch below the 20-EMA is a trend
-    change, not a pullback). Set min_pullback_days=1 and a large
-    pullback_lookback to get the old, looser behaviour.
+    Pullback length = the run of consecutive closes at/below the 20-EMA that
+    ends the day before the reclaim. It must be at least `min_pullback_days`
+    (a one-day dip is noise) and at most `pullback_lookback` (a longer slide
+    is a broken trend, not a pullback).
 
-    Note: volume confirmation is scored but is NOT required to enter.
+    Structure stop = tighter of the 20-day swing low or the 50-EMA.
     """
     name = "pullback_trend"
 
-    def __init__(self, pullback_lookback: int = 10, min_pullback_days: int = 2, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, pullback_lookback: int = 10, min_pullback_days: int = 2,
+                 stop_mode: str = "structure", atr_mult: float = 2.0,
+                 filters: Optional[TechnicalFilters] = None):
+        super().__init__(stop_mode=stop_mode, atr_mult=atr_mult, filters=filters)
         self.pullback_lookback = pullback_lookback
         self.min_pullback_days = min_pullback_days
 
-    def _pullback_length(self, df: pd.DataFrame, i: int) -> int:
-        """Consecutive closes at/below the 20-EMA ending at bar i-1 (looks back at most lookback+1 bars)."""
-        n = 0
-        j = i - 1
-        while j >= 0 and n <= self.pullback_lookback and df["Close"].iloc[j] <= df["ema20"].iloc[j]:
-            n += 1
-            j -= 1
-        return n
+    def pullback_run(self, df: pd.DataFrame, i: int) -> int:
+        """Consecutive closes at/below the 20-EMA ending at bar i-1; counted up to pullback_lookback + 1."""
+        lo = max(0, i - self.pullback_lookback - 1)
+        close = df["Close"].to_numpy(dtype=float)[lo:i]
+        ema = df["ema20"].to_numpy(dtype=float)[lo:i]
+        run = 0
+        for c, e in zip(close[::-1], ema[::-1]):
+            if c <= e:
+                run += 1
+            else:
+                break
+        return run
 
     def signal(self, df: pd.DataFrame, i: int) -> Signal:
         if i < self.min_bars_required:
@@ -123,15 +170,14 @@ class PullbackTrendStrategy(Strategy):
         ema50_prior = df["ema50"].iloc[max(0, i - 20)]
         ema50_sloping_up = bool(ema50_now > ema50_prior)
 
-        pullback_len = self._pullback_length(df, i)
-        had_pullback = self.min_pullback_days <= pullback_len <= self.pullback_lookback
         reclaimed_today = bool(today["Close"] > today["ema20"] and yesterday["Close"] <= yesterday["ema20"])
-        pullback_and_reclaim = had_pullback and reclaimed_today
+        run = self.pullback_run(df, i)
+        pullback_and_reclaim = reclaimed_today and self.min_pullback_days <= run <= self.pullback_lookback
 
         vol_confirmed = bool(today["Volume"] > today["vol_avg20"]) if pd.notna(today["vol_avg20"]) else False
 
         swing_low = df["Low"].iloc[max(0, i - 20):i + 1].min()
-        stop = self._pick_stop(today, [swing_low, today["ema50"]])
+        stop = self._stop(df, i, [swing_low, today["ema50"]])
         has_valid_stop = stop is not None
 
         conditions = {
@@ -142,12 +188,15 @@ class PullbackTrendStrategy(Strategy):
             "volume_confirmed": vol_confirmed,
             "has_valid_stop": has_valid_stop,
         }
+        extra = self._filter_conditions(df, i)
+        conditions.update(extra)
 
-        enter = all([price_above_20ema, price_above_50ema, ema50_sloping_up, pullback_and_reclaim, has_valid_stop])
+        enter = all([price_above_20ema, price_above_50ema, ema50_sloping_up, pullback_and_reclaim,
+                     has_valid_stop]) and all(extra.values())
         return Signal(enter=enter, entry=float(today["Close"]) if enter else None,
-                       stop=float(stop) if enter and has_valid_stop else None,
-                       reason="pullback + reclaim of rising 20/50 EMA trend" if enter else "conditions not met",
-                       conditions=conditions)
+                      stop=stop if enter else None,
+                      reason="pullback + reclaim of rising 20/50 EMA trend" if enter else "conditions not met",
+                      conditions=conditions)
 
     def trend_intact(self, df: pd.DataFrame, i: int) -> dict:
         today = df.iloc[i]
@@ -163,14 +212,16 @@ class PullbackTrendStrategy(Strategy):
 class BreakoutStrategy(Strategy):
     """
     Breaks out above its own recent range on strong volume, with the
-    longer-term trend still up. Stop = the breakout level itself (the old
-    resistance, now expected to act as support) or the 20-EMA, whichever
-    is tighter (or an ATR stop, if stop_mode="atr").
+    longer-term trend still up. Structure stop = just below the breakout
+    level (old resistance, now expected to act as support) or the 20-EMA,
+    whichever is tighter.
     """
     name = "breakout"
 
-    def __init__(self, breakout_lookback: int = 20, volume_multiple: float = 1.5, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, breakout_lookback: int = 20, volume_multiple: float = 1.5,
+                 stop_mode: str = "structure", atr_mult: float = 2.0,
+                 filters: Optional[TechnicalFilters] = None):
+        super().__init__(stop_mode=stop_mode, atr_mult=atr_mult, filters=filters)
         self.breakout_lookback = breakout_lookback
         self.volume_multiple = volume_multiple
 
@@ -190,9 +241,10 @@ class BreakoutStrategy(Strategy):
         vol_avg = today["vol_avg20"]
         strong_volume = bool(pd.notna(vol_avg) and today["Volume"] > vol_avg * self.volume_multiple)
 
-        closed_near_high = bool(today["Close"] >= today["Low"] + 0.7 * (today["High"] - today["Low"])) if today["High"] > today["Low"] else True
+        closed_near_high = (bool(today["Close"] >= today["Low"] + 0.7 * (today["High"] - today["Low"]))
+                            if today["High"] > today["Low"] else True)
 
-        stop = self._pick_stop(today, [prior_high * 0.98, today["ema20"]])
+        stop = self._stop(df, i, [prior_high * 0.98, today["ema20"]])
         has_valid_stop = stop is not None
 
         conditions = {
@@ -203,12 +255,14 @@ class BreakoutStrategy(Strategy):
             "closed_near_high": closed_near_high,
             "has_valid_stop": has_valid_stop,
         }
+        extra = self._filter_conditions(df, i)
+        conditions.update(extra)
 
-        enter = all([price_above_50ema, ema50_sloping_up, broke_out, strong_volume, has_valid_stop])
+        enter = all([price_above_50ema, ema50_sloping_up, broke_out, strong_volume, has_valid_stop]) and all(extra.values())
         return Signal(enter=enter, entry=float(today["Close"]) if enter else None,
-                       stop=float(stop) if enter and has_valid_stop else None,
-                       reason=f"broke {self.breakout_lookback}-day range on volume" if enter else "conditions not met",
-                       conditions=conditions)
+                      stop=stop if enter else None,
+                      reason=f"broke {self.breakout_lookback}-day range on volume" if enter else "conditions not met",
+                      conditions=conditions)
 
     def trend_intact(self, df: pd.DataFrame, i: int) -> dict:
         today = df.iloc[i]

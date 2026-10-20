@@ -1,0 +1,15 @@
+symbol,strategy,score,total,entry,stop,target,target_gain_pct,quantity,capital_required,risk_amount,reason,sector,over_sector_cap,error,price on 2026-09-04
+CARBORUNIV,breakout,6,6,1121.0,1095.97,1171.07,4.47,59,66139.0,1476.96,broke 20-day range on volume,Capital Goods,False,,1130.6
+GRASIM,breakout,6,6,3380.5,3282.61,3576.28,5.79,15,50707.5,1468.38,broke 20-day range on volume,Construction Materials,False,,3322.0
+PAYTM,breakout,6,6,1584.1,1430.31,1891.68,19.42,9,14256.9,1384.11,broke 20-day range on volume,Financial Services,False,,1659.5
+SUMICHEM,breakout,6,6,561.25,540.86,602.03,7.27,73,40971.25,1488.32,broke 20-day range on volume,Chemicals,False,,493.4
+SYRMA,breakout,6,6,1516.4,1438.64,1671.92,10.26,19,28811.6,1477.44,broke 20-day range on volume,Capital Goods,False,,1457.3
+TITAN,breakout,6,6,5090.0,4904.9,5460.2,7.27,8,40720.0,1480.8,broke 20-day range on volume,Consumer Durables,False,,5020.0
+BRIGADE,breakout,6,6,607.7,576.68,669.74,10.21,48,29169.6,1488.91,broke 20-day range on volume,Realty,False,,696.1
+NAUKRI,breakout,6,6,1282.0,1252.34,1341.32,4.63,50,64100.0,1482.9,broke 20-day range on volume,Consumer Services,False,,1319.8
+GLAND,breakout,6,6,2667.3,2581.61,2838.67,6.42,17,45344.1,1456.66,broke 20-day range on volume,Healthcare,False,,2932.4
+BELRISE,breakout,5,6,252.77,245.0,268.31,6.15,193,48784.61,1499.61,broke 20-day range on volume,Automobile and Auto Components,False,,236.86
+MINDACORP,breakout,5,6,736.1,721.18,765.94,4.05,100,73610.0,1491.8,broke 20-day range on volume,Automobile and Auto Components,False,,702.8
+RAMCOCEM,breakout,5,6,953.75,934.18,992.88,4.1,76,72485.0,1486.94,broke 20-day range on volume,Construction Materials,False,,884.5
+INDGN,breakout,5,6,568.75,556.44,593.36,4.33,121,68818.75,1489.03,broke 20-day range on volume,Healthcare,False,,601.5
+TOTAL,,,,,,,,,643918.31,,,,,,

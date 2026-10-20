@@ -13,26 +13,15 @@ lists; neither is reachable from a sandboxed environment.
 ## Architecture
 
 ```
-data.py               Fetches OHLCV + indicators (EMA, ATR, traded value) from Yahoo Finance
-universe.py            Fetches live NIFTY index constituent lists from NSE (+ saves dated snapshots)
-membership.py           POINT-IN-TIME MEMBERSHIP — who was in the index on a given past date
-strategies.py           STRATEGY ENGINE — pullback_trend, breakout, pluggable; structure or ATR stops
+data.py               Fetches OHLCV + indicators from Yahoo Finance
+fundamentals.py        Yahoo annual-statement ratios + rule checks (screen only)
+universe.py            Fetches live NIFTY index constituent lists from NSE
+strategies.py           STRATEGY ENGINE — pullback_trend, breakout, pluggable
 risk.py                 RISK ENGINE — position sizing, targets, portfolio heat
-filters.py               PRE-TRADE FILTERS — liquidity, stop width, results-date calendar
-market.py                 MARKET CONTEXT — index regime check + relative strength vs Nifty
-exits.py                   EXIT RULES — breakeven/trailing/time-stop, shared by monitor + backtester
-costs.py                    COST MODEL — STT/stamp/exchange/DP charges + slippage
-candidate_engine.py          CANDIDATE ENGINE — screens + ranks a universe, today
-backtester.py                 BACKTESTER — historical simulation + metrics
-validation.py                  VALIDATION — out-of-sample, sensitivity, walk-forward, Monte Carlo
-report.py                       HTML REPORT — offline equity/drawdown charts + validation tables
-monitor.py                     POSITION MONITOR — is an open position still valid
-screener.py                     CLI — wires it all together (screen / backtest / validate / snapshot-changes / monitor / update-price)
-test_toolkit.py                  Offline sanity tests (python test_toolkit.py)
-test_validation.py                Offline tests for the validation tools (python test_validation.py)
-test_membership.py                 Offline tests for membership, snapshots, ablation (python test_membership.py)
-real_data_check.py                  One command: real-data validation of both strategies into a dated folder
-index_changes.example.csv            Format example for --membership-file (made-up symbols)
+candidate_engine.py      CANDIDATE ENGINE — screens + ranks a universe, today
+backtester.py             BACKTESTER — historical simulation + metrics
+monitor.py                 POSITION MONITOR — is an open position still valid
+screener.py                  CLI — wires it all together (screen / backtest / monitor / update-price)
 ```
 
 Each module works standalone (import and use in your own scripts) or
@@ -50,7 +39,6 @@ pip install -r requirements.txt
 python screener.py screen --index nifty200 --strategy pullback_trend
 python screener.py screen --index nifty500 --strategy breakout --min-score 5
 python screener.py screen --symbols RELIANCE TCS INFY --capital 100000 --risk-pct 1.5
-python screener.py screen --index nifty200 --regime-mode block --results-file results_calendar.csv
 ```
 
 Every candidate is scored (how many of the strategy's conditions are true),
@@ -66,11 +54,11 @@ python screener.py backtest --index nifty200 --strategy breakout --period 3y --c
 python screener.py backtest --symbols RELIANCE TCS INFY --strategy pullback_trend
 ```
 
-This walks every symbol day by day, queuing an order when the strategy
-signals (using only that day and earlier — no lookahead), filling it at the
-next open, sizing each one through the Risk Engine against current equity, and
-enforcing your portfolio heat ceiling and max concurrent positions across the
-whole universe simultaneously, same as live trading would. Outputs:
+This walks every symbol day by day, entering trades exactly when the
+strategy would have signalled (using only that day and earlier — no
+lookahead), sizing each one through the Risk Engine, and enforcing your
+portfolio heat ceiling and max concurrent positions across the whole
+universe simultaneously, same as live trading would. Outputs:
 
 - Console summary: win rate, profit factor, expectancy, avg R-multiple, max
   drawdown, CAGR, total return
@@ -103,199 +91,6 @@ Output is a verdict — **Hold**, **Hold, but raise your stop**, **Trend
 broken — consider exiting**, **Time-stop reached**, or **Should already be
 closed** — plus the reasoning behind it. It does not place or close trades
 for you; you still execute the decision yourself.
-
-## What changed in this version (realism fixes + filters)
-
-**Backtest fixes**
-
-- **Equity-based sizing.** Risk per trade and the heat ceiling are measured against
-  current equity (cash + open positions), not free cash. Previously risk per trade
-  shrank, and heat % was overstated, as cash got deployed.
-- **Next-open entries.** A signal on today's close is filled at the NEXT day's open
-  (how you actually trade after a post-market screen). Size, heat and max-position
-  checks happen at fill time with the real fill price. If several orders compete for
-  the same slots they are filled best-ranked first (score, relative strength, stop
-  tightness) — the same order the screener shows.
-- **Gap-aware exits.** If a day opens through your stop you exit at the open, not at
-  the stop price; a gap above target fills at the open. If both stop and target are
-  inside one day's range, the stop is assumed first.
-- **Backtest uses your real exit rules.** Breakeven at +1R, trail below the latest
-  swing low, and the 14-day time-stop (executed at the next open) now run in the
-  backtest via `exits.py`, the same code the monitor uses. `--no-trailing` and
-  `--time-stop-days 0` switch them off for comparison.
-- **Costs and slippage.** Statutory charges and 0.10% slippage per market fill are
-  deducted by default. The numbers in `costs.py` are estimates of typical
-  discount-broker DELIVERY charges — check them against a contract note from your
-  own broker. `--no-costs` gives gross results. Capital gains tax is not deducted.
-- **Ranking fix.** Reward:risk was the old tiebreaker but is identical for every
-  candidate (target is a fixed multiple of the stop distance). Ranking is now:
-  score → relative strength vs Nifty (63-day) → tighter stop.
-- **Behaviour change in the monitor:** the trailing stop now starts only after +1R,
-  as the rules above describe. The old code trailed to the swing low at any R.
-
-**New filters and options** (screen and backtest)
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `--regime-ema` | 50 | Nifty must close above this EMA. `0` = off. Backtest blocks entries when it doesn't; screen follows `--regime-mode` |
-| `--regime-mode` | flag | (screen) `flag` keeps candidates but marks them, `block` drops them, `off` ignores regime |
-| `--benchmark` | ^NSEI | Index used for regime and relative strength |
-| `--min-traded-value` | 5 | Min 20-day average traded value, Rs crore (0 = off) |
-| `--min-risk-fraction` | 0.5 | Skip setups where capital limits cut your risk below this fraction of the intended risk (a very tight stop that would swallow all your capital, or a 1–2 share stub). 0 = off |
-| `--max-stop-pct` | 8 | Reject setups whose stop is wider than this % of entry (0 = off) |
-| `--stop-mode` | structure | `structure` (swing low / EMA / breakout level) or `atr` (close − `--atr-mult` × ATR14) |
-| `--pullback-lookback` | 10 | pullback_trend: LONGEST pullback (consecutive closes at/below the 20-EMA) that still counts |
-| `--min-pullback-days` | 2 | pullback_trend: SHORTEST pullback that counts (1 = the old, looser behaviour) |
-| `--membership-file` | — | Index-changes CSV for point-in-time membership (backtest/validate, `--index` mode only) |
-| `--atr-mult` | 2.0 | ATR multiple for `--stop-mode atr` |
-| `--results-file` | — | Your own file of result dates; entries near a result are skipped |
-| `--results-buffer-days` | 14 | Skip if results are due within this many days |
-
-Backtest-only: `--no-costs`, `--slippage-pct`, `--brokerage-pct`, `--no-trailing`,
-`--time-stop-days`.
-
-Anything dropped by a filter is reported, never silently removed: the screen prints
-a "dropped by your filters" summary, and the backtest metrics include
-`signals_skipped` by reason.
-
-**Results calendar file** (Yahoo's earnings dates for NSE stocks are unreliable, so
-this is a file you maintain):
-
-```
-# symbol,date
-RELIANCE,2026-10-17
-INFY,2026-10-15
-```
-
-**Defaults changed the numbers.** With the defaults above, backtest results will
-differ from earlier runs (costs, next-open fills, regime filter, trailing). To see
-the effect of each piece, switch them off one at a time (`--no-costs`,
-`--regime-ema 0`, `--no-trailing`, `--min-traded-value 0 --max-stop-pct 0`).
-
-## Validating a backtest — is the edge real or just luck?
-
-One backtest number can look good by luck or by tuning. `validate` asks harder
-questions of the same rules, with the same defaults as `backtest`:
-
-```
-python screener.py validate --index nifty200 --period 5y
-python screener.py validate --index nifty200 --period 5y \
-    --sweep reward_risk=1.5,2,3 --sweep atr_mult=1.5,2,2.5 --sweep stop_mode=structure,atr \
-    --wf-train-months 12 --wf-test-months 3
-```
-
-Use `--period 5y` or more: each section needs enough trades (15+ per half, 20+
-out-of-sample in walk-forward) to say anything, and the tool tells you when it
-doesn't have them rather than printing a confident-looking verdict.
-
-| Section | Question it answers |
-|---|---|
-| Equity + daily drawdown charts | What did the path actually look like? |
-| 1. In-sample vs out-of-sample (`--split 0.7` or a date) | Does it hold on the part of the history it wasn't "looked at" on? |
-| 2. By calendar year | Is all the profit from one good year? |
-| 3. By market regime at entry | Does it only work when Nifty is above its 50-EMA? (Empty "below" group is expected while the regime filter is on — run with `--regime-ema 0` to see it.) |
-| 4. Monte Carlo (`--mc-sims`) | How bad could the drawdown have been had the same trades arrived in a different order? Plan for the 95th percentile, not the path that happened |
-| 5. Parameter sensitivity (`--sweep name=v1,v2,...`, repeatable) | Does it still work when parameters move, or only at one magic setting? Flags parameters that have no effect at all |
-| 6. Walk-forward (`--wf-train-months`, `--wf-test-months`) | Pick parameters using only past, already-closed trades, then score them on the next unseen window, and roll forward. Compared against just keeping your base parameters |
-| 7. Ablation (`--ablation`) | Which feature is carrying the result? Switches costs, regime filter, trailing, time-stop, the extra filters, ATR stops and the loose pullback off one at a time |
-
-Sweepable names: `reward_risk`, `risk_pct`, `heat_ceiling`, `max_positions`,
-`atr_mult`, `stop_mode`, `max_stop_pct`, `min_traded_value`, `regime_ema`,
-`time_stop_days`, plus `pullback_lookback` (pullback_trend) and
-`breakout_lookback` / `volume_multiple` (breakout). `--max-combos` (default 60)
-stops you launching a huge grid.
-
-Outputs: `validation_report.html` (open in any browser — it is self-contained, no
-internet, scripts or external fonts needed) and `validation_sweep.csv`.
-
-**How to read it**
-
-- Every extra parameter you sweep raises the chance that the best row is luck.
-  Look at whether the best row's *neighbours* are also good, and at the share of
-  parameter sets that are profitable — not just the winner.
-- Walk-forward efficiency (out-of-sample avg R ÷ training avg R) near 1 or above is
-  reassuring; well below ~0.5 suggests the in-window results were mostly fit.
-- Median R is shown next to average R because a few outliers can move the average.
-
-**Limits of these tools (be honest with yourself about them)**
-
-- Survivorship bias is unchanged: everything runs on today's index constituents.
-- Sweeps and walk-forward run each parameter set once over the whole period and
-  slice its trades by date. That approximates, but is not identical to, switching
-  parameters mid-stream with positions carried across.
-- Monte Carlo drawdown is trade-to-trade, not daily mark-to-market, and treats
-  overlapping trades as sequential. Treat it as a range, not a forecast.
-- None of this proves a strategy will work going forward; it can only show that
-  it was not obviously a fluke on the data you have.
-
-**Pullback definition changed (this affects pullback_trend results).** Earlier
-versions said "had a pullback" if any close in the last N days was below the
-20-EMA. Because the reclaim rule already requires *yesterday* to have closed at or
-below the 20-EMA, that was always true, so `pullback_lookback` did nothing. Now
-the pullback is the run of consecutive closes at/below the 20-EMA that ends the
-day before the reclaim, and it must last between `--min-pullback-days` (default 2:
-a one-day dip is noise) and `--pullback-lookback` (default 10: a longer stretch
-below the 20-EMA is a trend change). `--min-pullback-days 1` with a large lookback
-gives the old behaviour. Note also that volume confirmation is *scored* but not
-*required* to enter, despite the strategy description saying "on rising volume".
-That was left as is; say if you want it required.
-
-## Point-in-time index membership (reduces survivorship bias)
-
-`--index` normally uses TODAY's constituents, so stocks dropped from the index
-(often because they did badly) are invisible to the backtest. With
-`--membership-file`, the tool reconstructs who was in the index on each past
-date by undoing the changes you give it, downloads former members too, and
-only allows entries on days a stock was actually in the index.
-
-```
-python screener.py backtest --index nifty200 --period 5y --membership-file index_changes.csv
-python screener.py validate --index nifty200 --period 5y --membership-file index_changes.csv
-```
-
-**You have to supply the changes file** — I could not fetch historical index
-data and did not invent any. See `index_changes.example.csv` for the format
-(`date,symbol,action`, effective date = first day the change applies). NSE
-Indices publishes "Replacements in indices" press releases on niftyindices.com
-(`Press_Release/ind_prsDDMMYYYY.pdf`), normally effective the last working day
-of March and September; each lists additions and removals per index, by company
-name (you need the NSE ticker). Work backwards from today. Nifty 500 changes
-a lot per rebalance (the September 2026 review replaced 27 names); Nifty 50 or
-100 are far less work to transcribe. The tool checks your rows against today's
-list and prints a warning for anything that doesn't add up.
-
-Going forward you can build the file automatically: `universe.py` now saves a
-dated snapshot of each index list it downloads (`.cache/snapshots/`), and
-
-```
-python screener.py snapshot-changes --index nifty200 --out index_changes.csv
-```
-
-diffs those snapshots into change rows (dates are when a change was first *seen*,
-on or after the true effective date). This only covers the time since you started
-saving snapshots.
-
-**What it does not fix.** Yahoo often has no price data for delisted, merged or
-renamed tickers, so a former member may be impossible to backtest. Every run now
-prints how many former members had no data and lists them. Survivorship bias is
-*reduced, not eliminated*, and what remains still biases results optimistic.
-
-## Real-data check (run this first)
-
-Everything in this toolkit has been tested on synthetic data only. Before relying
-on any number, run it on real prices, on a machine with normal internet access:
-
-```
-python real_data_check.py --check-only     # are Yahoo and NSE reachable?
-python real_data_check.py --quick          # nifty200, 5y, both strategies, reward_risk sweep only
-python real_data_check.py                  # full sweeps (slower)
-```
-
-It saves a dated folder with `summary_<strategy>.txt`,
-`validation_report_<strategy>.html` and `validation_sweep_<strategy>.csv`. Read
-the verdict lines first, then the "what is driving the result" table: if the
-result is only positive with costs off, or only with one filter on, that feature,
-not the strategy, is carrying it.
 
 ## Sector concentration check (screen only)
 
@@ -338,7 +133,97 @@ simple price-tracking log across your screening runs over time. Running it
 twice on the same day overwrites that day's column rather than duplicating
 it. The `TOTAL` row is left blank in the new column, since it isn't a stock.
 
-## Core options (both screen and backtest)
+## Technical filters (from the shortlisting doc, section 3)
+
+Three extra gates are applied on top of every strategy's own conditions, in
+both `screen` and `backtest`. Each adds a named condition to the score
+(`liquidity_ok`, `above_sma200`, `near_52w_high`) and must be true for an
+entry to fire. All are on by default and can be switched off:
+
+| Flag | Default | Rule |
+|---|---|---|
+| `--min-turnover-cr` | 1.0 | 20-day average of Close x Volume at least this many Rs crore (0 disables) |
+| `--sma200` / `--no-sma200` | on | Close above the 200-day SMA |
+| `--max-from-high-pct` | 20 | Close within this % of the 52-week high (0 disables) |
+
+Notes: stocks with fewer than ~200 bars of history fail the SMA200 and
+52-week checks (so very recent listings are excluded), and on a `--period 2y`
+backtest the first ~200 trading days can't produce entries. Use `--period 3y`
+or longer if you want a full 2 years of tradable history. Because the filters
+add conditions, `total` in the output grows (e.g. 6 -> 9), so re-check any
+`--min-score` you rely on.
+
+**Market-cap label (screen only).** Each candidate gets `market_cap_cr` and
+`cap_class` (Large > 20,000 Cr, Mid 5,000-20,000, Small < 5,000) from Yahoo's
+current market cap. `--cap-class large|mid|small` keeps only that band;
+candidates where Yahoo had no market cap are kept and labelled `Unknown`.
+This is a live snapshot, not point-in-time, so it is not used in the backtester.
+
+## Fundamental filters (from the shortlisting doc, section 1) -- screen only
+
+```
+python screener.py screen --index nifty200 --fundamentals flag
+python screener.py screen --index nifty200 --fundamentals filter --skip-rules peg
+python screener.py screen --index nifty200 --fundamentals filter --max-de 1.0 --min-roce 12
+```
+
+Runs AFTER the technical screen, only on candidates that already qualified,
+so the number of Yahoo calls stays small. `flag` annotates each candidate
+(`fund_status` = pass / fail / n/a, `fund_notes`, plus `roce_pct`,
+`roe_avg_pct`, `debt_equity`, `pe`, `peg` in the CSV); `filter` also drops
+the ones that fail. Default is `off`.
+
+| Rule (`--skip-rules` name) | Default | Computed from |
+|---|---|---|
+| ROCE (`roce`) | >= 15% | EBIT / (total assets - current liabilities), latest year |
+| ROE (`roe`) | >= 15% avg | Net income / equity, average of up to 5 years Yahoo has |
+| Debt-to-equity (`de`) | <= 0.5 | Total debt / equity, latest year |
+| Interest coverage (`icr`) | >= 3x | EBIT / interest expense (no interest cost = infinite) |
+| Sales growth (`sales_growth`) | >= 10% | 3Y CAGR if 4 years exist, else YoY |
+| PAT growth (`pat_growth`) | >= 12% | 3Y CAGR if 4 years exist, else YoY |
+| P/E vs industry (`pe_vs_industry`) | <= industry median x 1.10 | Median trailing P/E of NSE-Industry peers in the screened universe (needs >= 5 peers) |
+| PEG (`peg`) | < 1.0 | P/E / PAT growth %, only when both are positive |
+
+How missing data is handled:
+- **n/a is not a pass.** A rule Yahoo can't supply shows as n/a in `fund_notes`. By default n/a does not reject a stock; `--strict-fundamentals` makes it a fail.
+- **Banks / NBFCs** (industry containing "Financial") are exempt from ROCE, D/E and interest coverage and shown as `exempt`. Use `--index` so sector info exists.
+- **P/E vs industry** builds peer medians by fetching P/E for the whole universe on the first run (slow for nifty500), then caches for 7 days under `.cache/fundamentals/`. Skip it with `--skip-rules pe_vs_industry`.
+- **PEG < 1** is strict; expect it to reject most stocks. Try it with `--skip-rules peg` to see how much it matters.
+
+Limitations: these are the latest annual statements, not point-in-time, so
+they are NOT used in `backtest` (that would add lookahead bias). Yahoo's
+Indian coverage has gaps and typically only ~4 annual periods, so spot-check
+anything surprising against the company's filings.
+
+## Ranking with fundamentals, and the thesis line (screen)
+
+**Ranking.** Candidates are ranked by combined points, then by reward:risk:
+
+    points = technical conditions true + fund_weight x fundamental rules passed
+
+`--fund-weight` (default 1.0) sets how much each passed fundamental rule is
+worth; `0` ranks on technicals only. Rules that are n/a or exempt (e.g. a bank's
+ROCE) earn nothing, so missing data lowers a stock's rank slightly instead of
+counting as a pass. With `--fundamentals off` the ranking is exactly what it
+was before. Note that in `flag` mode a stock that fails some fundamentals can
+still outrank one with weaker technicals; use `--fundamentals filter` if you
+want failures removed rather than just demoted.
+
+**Thesis.** Each candidate gets a one-line `thesis` (console and CSV), built
+from a template out of fields already computed -- no LLM, no new data:
+
+    BBB (Large cap, Capital Goods): pullback + reclaim of rising 20/50 EMA trend - pullback
+    and reclaim of the 20-EMA, rising 50-EMA, above 200-SMA, near 52-week high, liquid.
+    Entry 100, stop 95 (-5.0%), target 110 (+10.0%), R:R 2.0, risk Rs 50. Fundamentals pass
+    (6/7 rules): ROCE 22.1%, ROE 18.4%, D/E 0.12, P/E 18.0, PEG 0.9. Watch: some fundamentals
+    unavailable; not confirmed: volume above average.
+
+It restates why your rules fired and what to double-check (sector cap,
+failed or missing fundamentals, volume not confirmed). It is not a
+recommendation. The CSV also gains `fund_passed`, `fund_evaluated`,
+`cond_met` and `cond_missed` columns.
+
+## Shared options (both screen and backtest)
 
 
 | Flag | Default | Meaning |
@@ -371,15 +256,13 @@ it up automatically via `--strategy your_name`.
 
 ## Known limitations — read before trusting backtest numbers
 
-- **Survivorship bias**: by default `--index` fetches TODAY's constituent list (use `--membership-file` to reduce this, see above; it cannot remove it).
+- **Survivorship bias**: `--index` always fetches TODAY's constituent list.
   Backtesting 3 years back still uses today's NIFTY 500, not what was in the
   index 3 years ago — stocks that were removed (often because they performed
   badly) are invisible to the backtest. This inflates results.
-- **Costs are estimates.** Charges and slippage are deducted, but the rates in
-  `costs.py` are typical discount-broker figures, not yours — verify them. Income/
-  capital-gains tax is not deducted.
-- **Fills are daily-bar approximations.** No circuit-limit handling, no partial
-  fills, no intraday path; slippage is a flat percentage.
+- **No brokerage, STT, or taxes** are deducted in the backtest. Real returns
+  would be lower, especially with many small trades.
+- **No slippage** — fills assume you get exactly the signalled price.
 - **Same-day stop/target conflict**: if both the stop and target would have
   been hit on the same day, the backtester conservatively assumes the stop
   hit first. Real outcomes could go either way.
@@ -394,11 +277,6 @@ it up automatically via `--strategy your_name`.
 | File | From |
 |---|---|
 | `screening_results.csv` | `screen` — today's ranked candidates |
-| `backtest_trades.csv` | `backtest` — every simulated trade (incl. fees, exit reason) |
+| `backtest_trades.csv` | `backtest` — every simulated trade |
 | `backtest_equity.csv` | `backtest` — day-by-day equity curve |
-| `validation_report.html` | `validate` — charts + all validation tables, works offline |
-| `validation_sweep.csv` | `validate` — one row per parameter combination |
-| `index_changes.csv` | `snapshot-changes` — index additions/removals for `--membership-file` |
-| `.cache/snapshots/*.csv` | `universe.py` — dated copy of each index list downloaded |
-| `real_check_*/` | `real_data_check.py` — reports and summaries from a real-data run |
 | `.cache/*.csv` | `universe.py` — cached NSE index lists (1 day) |
