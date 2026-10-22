@@ -15,6 +15,8 @@ Subcommands:
                     thesis still hold, and what should your stop be now
   update-price      adds/refreshes one dated price column in an existing
                     screening_results.csv, leaving everything else untouched
+  train-meta        trains the optional meta-labeling filter (ML win probability per setup) and
+                    validates it walk-forward before you trust it (see meta_model.py)
   snapshot-changes  turns the dated index-list snapshots universe.py saves
                     into index-change rows for --membership-file
 
@@ -252,15 +254,35 @@ def apply_fundamentals(candidates, args, symbols, sector_map):
     return kept
 
 
+def apply_anomalies(candidates, args):
+    """Financial anomaly scan (anomaly.py) on candidates that already qualified. 'flag' annotates; 'filter' also
+    drops candidates with level High. Screen only: latest annual statements from screener.in, not point-in-time."""
+    import anomaly
+    print(f"\nFinancial anomaly scan on {len(candidates)} candidate(s) (screener.in statements, cached 7 days)...")
+    res = anomaly.analyse_many([(c.symbol, c.sector) for c in candidates], log=print)
+    kept = []
+    for c in candidates:
+        r = res.get(c.symbol, {})
+        c.anomaly_level, c.anomaly_flags = r.get("anomaly_level", ""), r.get("anomaly_flags", "")
+        print(f"  {c.symbol:<14} {c.anomaly_level:<6} {c.anomaly_flags or r.get('anomaly_notes', '')}")
+        if args.anomalies == "filter" and c.anomaly_level == "High":
+            continue
+        kept.append(c)
+    if len(kept) < len(candidates):
+        print(f"  {len(candidates) - len(kept)} candidate(s) dropped for High-level financial anomalies.")
+    return kept
+
+
 def apply_qualitative(candidates, args):
     """Section-4 news sentiment + governance red-flag scan on the candidates that already qualified.
     Mode 'flag' annotates; 'filter' also drops candidates with a High-severity red flag."""
-    scorer = None if args.llm == "none" else qual.LLMScorer(args.llm, args.llm_model, args.ollama_url)
+    scorer = qual.make_scorer(args.llm, args.llm_model, args.ollama_url)
+    gov = qual.load_gov_model(args.gov_model)
     names = qual.symbol_name_map()
     print(f"\nNews sentiment and governance scan on {len(candidates)} candidate(s) (last {args.news_days} days)...")
     kept = []
     for c in candidates:
-        q = qual.analyse(c.symbol, names.get(c.symbol, c.symbol), days=args.news_days, scorer=scorer)
+        q = qual.analyse(c.symbol, names.get(c.symbol, c.symbol), days=args.news_days, scorer=scorer, gov_model=gov)
         c.sentiment_30d, c.sentiment_trend = q.get("sentiment_30d"), q.get("sentiment_trend")
         c.qual_severity, c.qual_flags = q.get("flag_severity") or "", q.get("flag_text") or ""
         s30 = f"{c.sentiment_30d:+.2f}" if c.sentiment_30d is not None else "n/a"
@@ -292,19 +314,41 @@ def cmd_screen(args):
         elif bull:
             print(f"Market regime: {args.benchmark} is above its {args.regime_ema}-EMA.\n")
 
+    meta = None
+    if args.meta != "off":
+        import meta_model
+        try:
+            meta = meta_model.load(args.meta_model)
+        except Exception as e:
+            print(f"Error: could not load {args.meta_model} ({type(e).__name__}: {e}). "
+                  f"Train one with: python screener.py train-meta --index nifty200 --strategy {args.strategy}")
+            sys.exit(1)
+        if meta.strategy != args.strategy:
+            print(f"  [warning] the model was trained for '{meta.strategy}', you are screening '{args.strategy}'.")
+        if args.meta_min_prob is None:
+            args.meta_min_prob = meta.threshold
+        print(f"Meta-model loaded ({args.meta_model}, trained on {meta.payload['n_train']} rows)"
+              + (f"; filtering below {args.meta_min_prob}" if args.meta == "filter" else "") + ".\n")
     engine = CandidateEngine([strategy], risk_engine, sector_map=sector_map, benchmark=benchmark,
-                             trade_filters=build_trade_filters(args), results_calendar=load_calendar(args))
+                             trade_filters=build_trade_filters(args), results_calendar=load_calendar(args), meta=meta)
     print(f"Screening {len(symbols)} symbols with '{strategy.name}'...\n")
     candidates = engine.screen_universe(symbols)
     if engine.skipped:
         print("\nDropped by pre-trade filters: " +
               ", ".join(f"{REASON_LABELS.get(k, k)}: {n}" for k, n in engine.skipped.items()))
     candidates = [c for c in candidates if c.score >= args.min_score]
+    if meta is not None and args.meta == "filter":
+        before = len(candidates)
+        candidates = [c for c in candidates if c.meta_prob is None or c.meta_prob >= args.meta_min_prob]
+        print(f"Meta-model filter dropped {before - len(candidates)} of {before} candidate(s) "
+              f"(win probability below {args.meta_min_prob}).")
     if args.cap_class != "all":
         # "Unknown" (Yahoo had no market cap) is kept rather than silently dropped; it is labelled in the output.
         candidates = [c for c in candidates if c.cap_class.lower() in (args.cap_class, "unknown")]
     if args.fundamentals != "off" and candidates:
         candidates = apply_fundamentals(candidates, args, symbols, sector_map)
+    if args.anomalies != "off" and candidates:
+        candidates = apply_anomalies(candidates, args)
     if args.qualitative != "off" and candidates:
         candidates = apply_qualitative(candidates, args)
     ranked = engine.rank(candidates, fund_weight=args.fund_weight)
@@ -508,6 +552,61 @@ def cmd_validate(args):
     print("\nA rule-checking tool, not investment advice. A backtest is not a promise of future performance.")
 
 
+def cmd_train_meta(args):
+    """Collect every signal the strategy produced (no capacity limits), build point-in-time features, validate
+    walk-forward, and save the model if asked. See meta_model.py."""
+    import meta_model as mm
+    symbol_data, bench_df, runner, note = prepare_backtest(args)
+    bench = Benchmark(bench_df, regime_ema=args.regime_ema) if bench_df is not None else None
+    strategy = build_strategy(args)
+    print(f"\nCollecting every '{args.strategy}' signal (capital, position-count and heat limits lifted so that "
+          f"setup quality, not capacity, decides what is included)...")
+    res = runner({"capital": 1e8, "max_positions": 1000, "heat_ceiling": 10000.0})
+    ds = mm.build_dataset(res.trades, symbol_data, bench, strategy, label=args.label)
+    print(f"{len(res.trades)} trades -> {len(ds)} training rows (label: {args.label}; "
+          f"base rate {round(float(ds['label'].mean()) * 100, 1) if len(ds) else 'n/a'}% positive).")
+    if args.dataset_out and len(ds):
+        ds.to_csv(args.dataset_out, index=False)
+        print(f"Saved dataset to {args.dataset_out}")
+    if len(ds) < args.min_train_trades:
+        print(f"Only {len(ds)} rows; need at least {args.min_train_trades}. Use a longer --period or a wider "
+              f"universe (--index nifty200 / nifty500). Nothing saved.")
+        sys.exit(1)
+    try:
+        wf = mm.walk_forward(ds, args.wf_train_months, args.wf_test_months, args.min_train_trades, args.keep_top)
+    except ImportError as e:
+        print(f"Error: {e}. Install scikit-learn:  pip install scikit-learn")
+        sys.exit(1)
+
+    print(f"\nWalk-forward ({wf['folds']} fold(s), {wf['oos_trades']} out-of-sample trades, "
+          f"AUC {wf['auc'] if wf['auc'] is not None else 'n/a'}):")
+    b = wf["base"]
+    rows = [["Plain rules (no filter)", "-", b["trades"], b["win_pct"], b["avg_r"], b["total_r"]]]
+    for t in wf["tiers"][1:]:
+        rows.append([f"Keep top {t['keep_top_pct']}% by probability", t["min_prob"], t["trades"], t["win_pct"],
+                     t["avg_r"], t["total_r"]])
+    print(val.format_table(["Variant", "Min prob", "Trades", "Win %", "Avg R", "Total R"], rows))
+    if wf["improved_folds"]:
+        print(f"  Filter beat the unfiltered average R in {wf['improved_folds']} folds (top {int(args.keep_top * 100)}%).")
+    if wf.get("brier"):
+        br = wf["brier"]
+        print(f"  Brier score (lower is better): raw {br['raw']}, calibrated {br['calibrated']}, "
+              f"always-guess-the-base-rate {br['constant']}; calibration per fold: {wf['calib_methods']}")
+        if wf["reliability"]:
+            print("  Reliability (out-of-sample, 5 equal buckets by predicted probability; "
+                  "predicted should be close to actual):")
+            print(val.format_table(["Bucket", "Trades", "Mean predicted", "Actual win rate"],
+                                   [[r["bucket"], r["trades"], r["mean_pred"], r["actual_win"]] for r in wf["reliability"]]))
+    print("  Verdict: " + wf["verdict"])
+
+    model = mm.fit_and_save(ds, args.meta_out, args.strategy, args.label, wf)
+    print(f"\nSaved {args.meta_out} (trained on {len(ds)} rows; default cut-off {model.threshold}).")
+    print("Use it with:  python screener.py screen ... --meta flag   (or --meta filter)")
+    if note:
+        print(note)
+    print("A rule-checking aid, not investment advice. Only use the filter if the verdict above supports it.")
+
+
 def cmd_snapshot_changes(args):
     changes = changes_from_snapshots(args.index)
     if not changes:
@@ -692,10 +791,22 @@ def main():
                           help="Section 4: news sentiment + governance red-flag scan. flag = annotate, "
                                "filter = also drop High-severity red flags")
     p_screen.add_argument("--news-days", type=int, default=90, dest="news_days")
-    p_screen.add_argument("--llm", choices=["none", "ollama", "anthropic"], default="none",
+    p_screen.add_argument("--llm", choices=["none", "ollama", "anthropic", "finbert"], default="none",
                           help="score headlines with a language model instead of the keyword lexicon")
     p_screen.add_argument("--llm-model", dest="llm_model", default=None)
     p_screen.add_argument("--ollama-url", dest="ollama_url", default=None)
+    p_screen.add_argument("--gov-model", dest="gov_model", default=None,
+                          help="governance false-positive classifier (gov_model.pkl from gov_classifier.py train)")
+    p_screen.add_argument("--anomalies", choices=["off", "flag", "filter"], default="off",
+                          help="financial anomaly scan (cash flow vs profit, debtor/inventory days, other income, "
+                               "borrowings, margin swings): off (default), flag, filter (drop level High)")
+    p_screen.add_argument("--meta", choices=["off", "flag", "filter"], default="off",
+                          help="meta-model trade-quality filter: off (default), flag (add win probability, rank by it "
+                               "after points), filter (also drop candidates below --meta-min-prob)")
+    p_screen.add_argument("--meta-model", dest="meta_model", default="meta_model.pkl",
+                          help="model file written by the train-meta command")
+    p_screen.add_argument("--meta-min-prob", type=float, default=None, dest="meta_min_prob",
+                          help="cut-off for --meta filter (default: the threshold stored in the model)")
     p_screen.add_argument("--refresh-cache", action="store_true", dest="refresh_cache",
                           help="ignore cached screener.in / NSE / news results (--debug-dump implies this)")
     p_screen.add_argument("--debug-dump", dest="debug_dump", default=None,
@@ -725,6 +836,21 @@ def main():
     p_val.add_argument("--report", help="Write a self-contained HTML report here")
     p_val.add_argument("--sweep-out", dest="sweep_out", help="Write the sweep table to this CSV")
     p_val.set_defaults(func=cmd_validate)
+
+    p_tm = sub.add_parser("train-meta", help="Train the meta-labeling trade-quality filter (needs scikit-learn)")
+    add_common_args(p_tm)
+    add_backtest_args(p_tm)
+    p_tm.set_defaults(period="5y", func=cmd_train_meta)
+    p_tm.add_argument("--meta-out", default="meta_model.pkl", dest="meta_out")
+    p_tm.add_argument("--label", choices=["win", "target"], default="win",
+                      help="win = net profit after costs (default); target = profit target hit")
+    p_tm.add_argument("--wf-train-months", type=int, default=24, dest="wf_train_months")
+    p_tm.add_argument("--wf-test-months", type=int, default=6, dest="wf_test_months")
+    p_tm.add_argument("--min-train-trades", type=int, default=100, dest="min_train_trades",
+                      help="minimum closed trades before a fold may be trained / to save a model")
+    p_tm.add_argument("--keep-top", type=float, default=0.5, dest="keep_top",
+                      help="fraction of signals the stored cut-off keeps (by out-of-sample probability)")
+    p_tm.add_argument("--dataset-out", default=None, dest="dataset_out", help="also save the training rows as CSV")
 
     p_mon = sub.add_parser("monitor", help="Check whether an already-open position is still worth holding")
     p_mon.add_argument("--symbol", required=True)

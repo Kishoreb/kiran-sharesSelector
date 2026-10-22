@@ -25,6 +25,9 @@ import fundamentals as fund
 
 DEFAULT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fundamental_weights.csv")
 
+# Old rule name -> the rules that replaced it (FII and DII are now judged separately).
+LEGACY_RULES = {"institutional_trend": ("fii_trend", "dii_trend")}
+
 DESCRIPTIONS = {
     "roce": "ROCE >= --min-roce",
     "roe": "average ROE >= --min-roe",
@@ -32,12 +35,13 @@ DESCRIPTIONS = {
     "icr": "interest coverage >= --min-icr",
     "sales_growth": "sales growth >= --min-sales-growth",
     "pat_growth": "PAT growth >= --min-pat-growth",
-    "pe_vs_industry": "P/E <= industry median x 1.10 (needs --industry-pe)",
+    "pe_vs_industry": "P/E <= industry P/E x 1.10 (screener.in peer median, or industry_pe.csv)",
     "peg": "PEG < --max-peg",
     "promoter_holding": "promoter holding >= --min-promoter (n/a if the company has no promoter)",
     "promoter_trend": "promoter holding has NOT fallen in each of the last 3 quarters",
     "pledging": "pledged share of promoter holding <= --max-pledge",
-    "institutional_trend": "FII+DII holding did not fall over the latest quarter",
+    "fii_trend": "FII holding did not fall over the latest quarter",
+    "dii_trend": "DII holding did not fall over the latest quarter",
 }
 
 
@@ -51,7 +55,8 @@ def template_text() -> str:
 
 
 def load_weights(path: str = None, create: bool = True) -> dict:
-    """Returns {rule: weight} for every rule in fundamentals.ALL_RULES (missing rules default to 1)."""
+    """Returns {rule: weight} for every rule in fundamentals.ALL_RULES (missing rules default to 1).
+    The retired rule name institutional_trend is still read and mapped to fii_trend + dii_trend."""
     path = path or DEFAULT_FILE
     if not os.path.exists(path):
         if create:
@@ -60,6 +65,7 @@ def load_weights(path: str = None, create: bool = True) -> dict:
             print(f"  [info] wrote a template weights file: {path}")
         return {r: 1.0 for r in fund.ALL_RULES}
     weights = {r: 1.0 for r in fund.ALL_RULES}
+    explicit, legacy = set(), {}
     with open(path, newline="", encoding="utf-8") as f:
         for lineno, row in enumerate(csv.reader(f), 1):
             if not row or not row[0].strip() or row[0].strip().startswith("#"):
@@ -67,7 +73,7 @@ def load_weights(path: str = None, create: bool = True) -> dict:
             name = row[0].strip().lower()
             if name == "rule":
                 continue
-            if name not in fund.ALL_RULES:
+            if name not in fund.ALL_RULES and name not in LEGACY_RULES:
                 raise ValueError(f"{path} line {lineno}: unknown rule '{name}'. Valid: {', '.join(fund.ALL_RULES)}")
             if len(row) < 2:
                 raise ValueError(f"{path} line {lineno}: expected rule,weight")
@@ -78,7 +84,17 @@ def load_weights(path: str = None, create: bool = True) -> dict:
                 raise ValueError(f"{path} line {lineno}: weight '{raw}' is not a number")
             if w < 0:
                 raise ValueError(f"{path} line {lineno}: weight cannot be negative")
-            weights[name] = w
+            if name in LEGACY_RULES:
+                legacy[name] = w
+            else:
+                weights[name] = w
+                explicit.add(name)
+    for old, w in legacy.items():                       # old file: apply its weight to the replacement rules
+        for new in LEGACY_RULES[old]:
+            if new not in explicit:
+                weights[new] = w
+        print(f"  [info] {path}: '{old}' is now two rules ({', '.join(LEGACY_RULES[old])}); "
+              f"weight {w:g} applied to both. Update the file to silence this.")
     return weights
 
 

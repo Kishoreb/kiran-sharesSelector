@@ -1,6 +1,7 @@
 # Fundamental rule weights. One rule per line: rule,weight
 # weight 0 skips the rule; any positive number counts it (2 = twice as important as 1).
 # Thresholds themselves are command-line options (--min-roce, --max-de, ...).
+# Used by `screener.py screen` and holdings_analysis.py.
 rule,weight
 roce,1   # ROCE >= --min-roce
 roe,1   # average ROE >= --min-roe
@@ -8,9 +9,10 @@ de,1   # debt-to-equity <= --max-de
 icr,1   # interest coverage >= --min-icr
 sales_growth,1   # sales growth >= --min-sales-growth
 pat_growth,1   # PAT growth >= --min-pat-growth
-pe_vs_industry,1   # P/E <= industry median x 1.10 (needs --industry-pe)
+pe_vs_industry,1   # P/E <= industry P/E x 1.10 (screener.in peer median, or industry_pe.csv)
 peg,1   # PEG < --max-peg
 promoter_holding,1   # promoter holding >= --min-promoter (n/a if the company has no promoter)
 promoter_trend,1   # promoter holding has NOT fallen in each of the last 3 quarters
 pledging,1   # pledged share of promoter holding <= --max-pledge
-institutional_trend,1   # FII+DII holding did not fall over the latest quarter
+fii_trend,1   # FII holding did not fall over the latest quarter
+dii_trend,1   # DII holding did not fall over the latest quarter

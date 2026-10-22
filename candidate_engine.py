@@ -57,6 +57,9 @@ class Candidate:
     sentiment_trend: Optional[float] = None
     qual_severity: str = ""                # '', 'Medium' or 'High' governance red-flag severity
     qual_flags: str = ""
+    anomaly_level: str = ""                # financial anomaly scan: "", "None", "Watch", "High" or "n/a"
+    anomaly_flags: str = ""
+    meta_prob: Optional[float] = None       # meta-model win probability (None = model off / not computable)
 
     @property
     def target_gain_pct(self) -> float:
@@ -69,7 +72,8 @@ class CandidateEngine:
     def __init__(self, strategies: List[Strategy], risk_engine: RiskEngine, sector_map: Optional[dict] = None,
                  fetch_market_cap: bool = True, benchmark: Optional[Benchmark] = None,
                  trade_filters: Optional[TradeFilters] = None,
-                 results_calendar: Optional[ResultsCalendar] = None):
+                 results_calendar: Optional[ResultsCalendar] = None, meta=None):
+        self.meta = meta                            # meta_model.MetaModel or None
         self.fetch_market_cap = fetch_market_cap
         self.strategies = strategies
         self.risk_engine = risk_engine
@@ -119,8 +123,19 @@ class CandidateEngine:
                 cond_missed=",".join(k for k, v in (sig.conditions or {}).items() if not v),
                 rel_strength=self.benchmark.relative_strength(df, i) if self.benchmark is not None else None,
                 stop_pct=round((sig.entry - sig.stop) / sig.entry * 100, 2),
+                meta_prob=self._meta_prob(df, i, sig, strat.name),
             ))
         return results
+
+    def _meta_prob(self, df, i, sig, strategy_name) -> Optional[float]:
+        """Meta-model win probability for this setup, or None if no model / features could not be built."""
+        if self.meta is None:
+            return None
+        try:
+            import meta_model
+            return self.meta.predict(meta_model.features_at(df, i, self.benchmark, sig, strategy_name))
+        except Exception:
+            return None
 
     def screen_universe(self, symbols: List[str], progress: bool = True) -> List[Candidate]:
         all_candidates = []
@@ -154,14 +169,15 @@ class CandidateEngine:
     @staticmethod
     def rank(candidates: List[Candidate], fund_weight: float = 1.0) -> List[Candidate]:
         """
-        Ranks by combined points (technical + fundamental), then by relative
-        strength vs the index (unknown ranks last), then by tighter stop.
+        Ranks by combined points (technical + fundamental), then by meta-model
+        probability (when a model is loaded), then by relative strength vs the index (unknown ranks last), then by tighter stop.
         Same ordering the backtester uses when several entries compete for
         one slot. A transparent, rule-based ranking, not a prediction.
         """
         def key(c: Candidate):
             rs = c.rel_strength if c.rel_strength is not None else float("-inf")
-            return (CandidateEngine.points(c, fund_weight), rs, -c.stop_pct)
+            mp = c.meta_prob if c.meta_prob is not None else float("-inf")
+            return (CandidateEngine.points(c, fund_weight), mp, rs, -c.stop_pct)
 
         return sorted(candidates, key=key, reverse=True)
 
@@ -227,9 +243,14 @@ class CandidateEngine:
             tr = f", trend {c.sentiment_trend:+.2f}" if c.sentiment_trend is not None else ""
             parts.append(f"News sentiment (30d) {c.sentiment_30d:+.2f}{tr}")
 
+        if c.meta_prob is not None:
+            parts.append(f"Meta-model win probability {c.meta_prob:.0%}")
+
         watch = []
         if c.qual_flags:
             watch.append("governance flags: " + c.qual_flags)
+        if c.anomaly_level in ("Watch", "High") and c.anomaly_flags:
+            watch.append(f"financial anomalies ({c.anomaly_level}): {c.anomaly_flags}")
         if c.over_sector_cap:
             watch.append("over your sector cap")
         if c.fund_status and "failed:" in c.fund_notes:

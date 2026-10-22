@@ -2,3 +2,8 @@ pandas
 numpy
 requests
 yfinance
+# Optional ML layers (add to requirements.txt). On Windows, get the right torch build from https://pytorch.org
+torch
+transformers
+scikit-learn
+openpyxl

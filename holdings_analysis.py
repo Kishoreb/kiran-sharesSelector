@@ -260,7 +260,7 @@ def analyse(h, strategies, sector_map, fcfg, args, weights=None, ind_pe=None):
         if names is None:
             names = args._names = qual.symbol_name_map()
         q = qual.analyse(h["symbol"], names.get(h["symbol"].upper(), h["name"]), days=args.news_days,
-                         scorer=getattr(args, "scorer", None))
+                         scorer=getattr(args, "scorer", None), gov_model=getattr(args, "gov", None))
         for k in ("news_n_30d", "sentiment_30d", "sentiment_trend", "sentiment_label", "flag_severity",
                   "flag_text", "top_negative", "q_notes"):
             r[k] = q.get(k)
@@ -325,6 +325,18 @@ def build(args):
     return rows, skipped
 
 
+def add_anomalies(rows):
+    """Financial anomaly scan (anomaly.py) over all analysed holdings; z-scores / Isolation Forest use the
+    holdings themselves as peers, so those layers only run with 8+ / 30+ stocks."""
+    import anomaly
+    print("Financial anomaly scan (screener.in statements, cached 7 days)...")
+    res = anomaly.analyse_many([(r["symbol"], r.get("sector", "")) for r in rows], log=print)
+    for r in rows:
+        x = res.get(r["symbol"], {})
+        r["anomaly_level"], r["anomaly_flags"] = x.get("anomaly_level"), x.get("anomaly_flags")
+        r["anomaly_iso_pct"], r["anomaly_notes"] = x.get("anomaly_iso_pct"), x.get("anomaly_notes")
+
+
 def add_portfolio_flags(rows, skipped, args):
     total = sum(r["live_value"] for r in rows) + sum(s["value"] for s in skipped)
     sec = defaultdict(float)
@@ -343,6 +355,8 @@ def add_portfolio_flags(rows, skipped, args):
             flags.append(f"position = {pt}% of a day's turnover (exit friction)")
         if r.get("flag_text"):
             flags.append("governance: " + r["flag_text"])
+        if r.get("anomaly_level") in ("High", "Watch") and r.get("anomaly_flags"):
+            flags.append(f"financial anomalies ({r['anomaly_level']}): " + r["anomaly_flags"])
         if r.get("above_200sma") is None:
             flags.append("<200 bars: 200-SMA unavailable")
         if abs(r.get("price_vs_statement_pct") or 0) > 25:
@@ -395,14 +409,18 @@ def main():
     ap.add_argument("--skip-qualitative", action="store_true", dest="skip_qualitative",
                     help="skip news sentiment and governance red-flag scan")
     ap.add_argument("--news-days", type=int, default=90, dest="news_days")
-    ap.add_argument("--llm", choices=["none", "ollama", "anthropic"], default="none",
+    ap.add_argument("--llm", choices=["none", "ollama", "anthropic", "finbert"], default="none",
                     help="score headlines with a language model instead of the keyword lexicon")
     ap.add_argument("--llm-model", dest="llm_model", default=None)
     ap.add_argument("--ollama-url", dest="ollama_url", default=None)
+    ap.add_argument("--gov-model", dest="gov_model", default=None,
+                    help="governance false-positive classifier (gov_model.pkl from gov_classifier.py train)")
     ap.add_argument("--refresh-cache", action="store_true", dest="refresh_cache",
                     help="ignore cached screener.in / NSE / news results and fetch everything fresh (--debug-dump implies this)")
     ap.add_argument("--debug-dump", dest="debug_dump", default=None,
                     help="folder to save raw screener.in pages and NSE JSON responses (for diagnosing layout changes)")
+    ap.add_argument("--skip-anomalies", action="store_true", dest="skip_anomalies",
+                    help="skip the financial anomaly scan (cash flow vs profit, debtor days, other income, ...)")
     ap.add_argument("--max-weight", type=float, default=25.0, dest="max_weight", help="flag positions above this %% of portfolio")
     ap.add_argument("--max-sector-weight", type=float, default=40.0, dest="max_sector_weight")
     ap.add_argument("--min-turnover-cr", type=float, default=1.0, dest="min_turnover_cr")
@@ -412,19 +430,23 @@ def main():
 
     fund.configure(provider=args.fund_source, growth_years=args.growth_years, use_nse=not args.no_nse,
                    fallback=not args.no_yahoo_fallback, debug_dir=args.debug_dump, refresh=args.refresh_cache)
-    args.scorer = None if args.llm == "none" else qual.LLMScorer(args.llm, args.llm_model, args.ollama_url)
+    args.scorer = qual.make_scorer(args.llm, args.llm_model, args.ollama_url)
+    args.gov = qual.load_gov_model(args.gov_model)
     rows, skipped = build(args)
     if not rows:
         sys.exit("Nothing could be analysed.")
+    if not args.skip_anomalies:
+        add_anomalies(rows)
     total, sec = add_portfolio_flags(rows, skipped, args)
     flag_rows = [{"symbol": r["symbol"], "severity": f["severity"], "flag": f["flag"], "source": f["source"],
-                  "date": f["date"], "text": f["text"], "link": f["link"]}
+                  "date": f["date"], "text": f["text"], "link": f["link"],
+                  "ml_prob": f.get("ml_prob"), "label": ""}
                  for r in rows for f in r.get("_flags", [])]
     for r in rows:
         r.pop("_flags", None)
     df, sk, sm = pd.DataFrame(rows), pd.DataFrame(skipped), summary_sheet(rows, skipped, total, sec)
     front = [c for c in ["symbol", "name", "verdict", "weight_pct", "live_value", "qty", "close", "trend_state",
-                         "fund_score", "fund_tier", "sentiment_label", "flag_severity", "flags"] if c in df.columns]
+                         "fund_score", "fund_tier", "sentiment_label", "flag_severity", "anomaly_level", "flags"] if c in df.columns]
     df = df[front + [c for c in df.columns if c not in front]]
 
     out = args.out or os.path.splitext(args.file)[0] + "_analysis.xlsx"

@@ -9,7 +9,8 @@ Ownership metrics (shortlisting doc, section 2):
   pledged_change_1q          change in pledged_pct vs the previous quarter (only when both quarters come
                              from XBRL shareholding filings of consecutive quarters)
   fii_pct, dii_pct           latest FII / DII holding % (screener.in table)
-  inst_change_1q / _4q       change in FII+DII holding, percentage points
+  fii_change_1q / _4q        change in FII holding, percentage points (FII and DII are NOT combined)
+  dii_change_1q / _4q        change in DII holding, percentage points
 
 Sources: NSE for promoter holding and pledging (official filings); screener.in's
 quarterly table for FII / DII history and as a fallback for promoter holding.
@@ -45,7 +46,8 @@ def compute(nse_holding, pledge_rows, screener_metrics=None, xbrl_pledge=None, x
     """nse_holding / pledge_rows: parsed lists, newest first. screener_metrics: dict with hold_* lists."""
     sm = screener_metrics or {}
     out = {k: None for k in ("promoter_pct", "promoter_change_1q", "promoter_change_4q", "promoter_decline_streak",
-                             "pledged_pct", "pledged_change_1q", "fii_pct", "dii_pct", "inst_change_1q", "inst_change_4q",
+                             "pledged_pct", "pledged_change_1q", "fii_pct", "dii_pct", "fii_change_1q", "fii_change_4q",
+                             "dii_change_1q", "dii_change_4q",
                              "ownership_src", "ownership_asof", "pledged_pct_total", "pledge_src", "pledge_asof",
                              "pledge_note")}
     srcs = []
@@ -101,12 +103,13 @@ def compute(nse_holding, pledge_rows, screener_metrics=None, xbrl_pledge=None, x
         out["fii_pct"] = fii[-1]
     if dii:
         out["dii_pct"] = dii[-1]
-    n = min(len(fii), len(dii))
-    if n >= 2:
-        inst = [a + b for a, b in zip(fii[-n:], dii[-n:])]
-        out["inst_change_1q"] = round(inst[-1] - inst[-2], 2)
-        if n >= 5:
-            out["inst_change_4q"] = round(inst[-1] - inst[-5], 2)
+    # FII and DII are judged separately: one can sell while the other buys, and a combined figure hides that
+    for key, series in (("fii", fii), ("dii", dii)):
+        if len(series) >= 2:
+            out[f"{key}_change_1q"] = round(series[-1] - series[-2], 2)
+        if len(series) >= 5:
+            out[f"{key}_change_4q"] = round(series[-1] - series[-5], 2)
+    if len(fii) >= 2 or len(dii) >= 2:
         srcs.append("screener.in FII/DII")
     out["ownership_src"] = " + ".join(srcs) or None
     return out

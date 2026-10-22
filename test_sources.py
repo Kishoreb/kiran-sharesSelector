@@ -37,6 +37,17 @@ QCOLS = ["Dec 2023", "Mar 2024", "Jun 2024", "Sep 2024", "Dec 2024", "Mar 2025",
 PROM = [58.0, 58.0, 57.5, 57.0, 56.2, 55.6, 55.2, 54.9]            # fell in the last 3+ quarters
 FII = [10.0, 10.2, 10.5, 10.4, 10.6, 10.9, 11.0, 11.4]
 DII = [8.0, 8.1, 8.3, 8.6, 8.9, 9.0, 9.2, 9.4]
+PEER_HEAD = ["S.No.", "Name", "CMP Rs.", "P/E", "Mar Cap Rs.Cr."]
+def peers_table(median_row=True):
+    rows = [["1.", "Alpha Ltd", "100", "20.0", "5,000"], ["2.", "Beta Ltd", "200", "30.0", "9,000"],
+            ["3.", "Loss Ltd", "50", "", "700"], ["4.", "Gamma Ltd", "80", "40.0", "3,000"]]
+    if median_row:
+        rows.append(["Median: 4 Peers", "110", "28.0", "4,000"])           # colspan'd leading cell: fewer cells than the header
+    h = "<thead><tr>" + "".join(f"<th>{c}</th>" for c in PEER_HEAD) + "</tr></thead>"
+    b = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in rows)
+    return f'<table class="data-table">{h}<tbody>{b}</tbody></table>'
+PEERS_SECTION = "<section id='peers'>" + peers_table() + "</section>"
+
 def page(with_ranges=True):
     top = ('<ul id="top-ratios">'
            '<li class="flex flex-space-between" data-source="default"><span class="name">Market Cap</span>'
@@ -57,7 +68,7 @@ def page(with_ranges=True):
     ra = tbl(YEARS[:-1], [("Debtor Days", [30] * 11), ("ROCE %", grow(15, .02))])
     sh = tbl(QCOLS, [("Promoters", PROM), ("FIIs", FII), ("DIIs", DII), ("Public", [24.0] * 8)])
     return (f"<html><body>{top}<section id='profit-loss'>{pl}</section><section id='balance-sheet'>{bs}</section>"
-            f"<section id='ratios'>{ra}</section><section id='shareholding'>{sh}</section></body></html>")
+            f"<section id='ratios'>{ra}</section><section id='shareholding'>{sh}</section>{PEERS_SECTION}</body></html>")
 
 raw = si.parse_page(page())
 assert raw["top"]["Stock P/E"] == "24.5" and si.num(raw["top"]["Market Cap"]) == 12345.0, raw["top"]
@@ -87,6 +98,30 @@ try:
     si.get_raw("ZZZ", refresh=True); raise AssertionError("should have raised")
 except RuntimeError as ex:
     assert "layout" in str(ex)
+# industry P/E: the peer table's Median row (28.0), read from the right so the colspan'd row still lines up
+assert raw["peers"] == {"median_pe": 28.0, "n": 3}, raw["peers"]
+assert m["industry_pe"] == 28.0 and m["industry_pe_src"] == "screener.in peer median" and m["industry_pe_n"] == 3
+assert si.parse_peers_fragment(peers_table(median_row=False)) == {"median_pe": 30.0, "n": 3}     # no Median row: our own median
+assert si.parse_peers_fragment("<p>no table</p>") is None
+res_pe = fund.evaluate(m, "x", fund.FundamentalFilters(), None)                                  # P/E 24.5 <= 28.0 x 1.10
+assert "pe_vs_industry" in res_pe["passed"] and res_pe["industry_pe"] == 28.0, res_pe
+assert "pe_vs_industry" in fund.evaluate(dict(m, pe=40.0), "x", fund.FundamentalFilters(), None)["failed"]
+assert "pe_vs_industry" in fund.evaluate(dict(m, industry_pe=None), "x", fund.FundamentalFilters(), None)["unknown"]
+ov = fund.evaluate(dict(m, pe=40.0), "x", fund.FundamentalFilters(), (50.0, 0, "industry_pe file"))   # override beats the page value
+assert "pe_vs_industry" in ov["passed"] and ov["industry_pe"] == 50.0 and ov["industry_pe_src"] == "industry_pe file"
+ovf = os.path.join(TMP, "industry_pe.csv"); open(ovf, "w").write("# industry,pe\nIndustry,pe\nCapital Goods,42.5\nbad,xx\n")
+assert fund.load_industry_pe_overrides(ovf) == {"capital goods": 42.5} and fund.load_industry_pe_overrides(ovf + ".none") == {}
+assert fund.override_for({"capital goods": 42.5}, " Capital Goods ") == (42.5, 0, "industry_pe file") and fund.override_for({}, "x") is None
+# FII and DII are separate rules; falling FII fails only fii_trend
+r_f = fund.evaluate(dict(m, fii_change_1q=-0.3, dii_change_1q=0.4), "x", fund.FundamentalFilters(), None)
+assert "fii_trend" in r_f["failed"] and "dii_trend" in r_f["passed"] and "institutional_trend" not in fund.ALL_RULES
+# weights file written before the split: institutional_trend maps to both new rules
+import fund_weights as fw
+wf = os.path.join(TMP, "w.csv"); open(wf, "w").write("rule,weight\nroce,2\ninstitutional_trend,0\npeg,0   # off\n")
+w = fw.load_weights(wf)
+assert w["roce"] == 2 and w["fii_trend"] == 0 and w["dii_trend"] == 0 and w["peg"] == 0 and w["roe"] == 1 and set(w) == set(fund.ALL_RULES)
+open(wf, "w").write("rule,weight\ninstitutional_trend,0\ndii_trend,3\n")
+w = fw.load_weights(wf); assert w["fii_trend"] == 0 and w["dii_trend"] == 3                     # explicit new rule wins
 print("screener.in parsing ok: 11y series, 3/5/10Y CAGR (site blocks and own fallback), ROE, D/E, ICR, PEG, shareholding")
 
 # ---- page-structure variants seen / suspected on real pages (V-Mart, JSFB, Bajaj Housing failed to parse)
@@ -150,6 +185,25 @@ si.time.sleep = _sleep
 si._http_get = lambda url: R(200, page())
 print("screener.in fallbacks ok: standalone fills long CAGR horizons (labelled), retries on DNS errors")
 
+# ---- peers table loaded by a second request (page has a company id but no peers table in it)
+no_peers = page().replace(PEERS_SECTION, "").replace("<html><body>", "<html><body><div id='company-info' data-company-id='111' data-warehouse-id='222'></div>")
+ajax = []
+def peers_http(url):
+    ajax.append(url)
+    if url.endswith("/api/company/222/peers/"): return R(200, peers_table())
+    if "/api/company/" in url: return R(404)
+    return R(200, no_peers)
+si._http_get = peers_http
+si.CACHE_DIR = os.path.join(TMP, "si_peers")
+rp_ = si.get_raw("AJAXCO")
+assert rp_["peers"] == {"median_pe": 28.0, "n": 3} and si.metrics_from_raw(rp_)["industry_pe"] == 28.0, rp_["peers"]
+assert any(u.endswith("/api/company/222/peers/") for u in ajax), ajax
+si._http_get = lambda url: R(404) if "/api/company/" in url else R(200, no_peers)               # endpoint dead: no crash, rule n/a
+si.CACHE_DIR = os.path.join(TMP, "si_peers2")
+r2_ = si.get_raw("NOPEERS"); assert r2_["peers"] is None and si.metrics_from_raw(r2_)["industry_pe"] is None
+si._http_get = lambda url: R(200, page()); si.CACHE_DIR = os.path.join(TMP, "screener_in")
+print("peers ok: Median row / own median / AJAX fallback / dead endpoint -> n/a; override file and legacy weights handled")
+
 # ------------------------------------------------------------------ NSE parsing
 today = date.today()
 fmt = lambda d: d.strftime("%d-%b-%Y").upper()
@@ -196,12 +250,13 @@ assert ownership.decline_streak([55, 56, 55.5, 55.0]) == 2 and ownership.decline
 o = ownership.compute(sh, pg, m)
 assert o["promoter_pct"] == 54.9 and o["promoter_decline_streak"] == 4 and o["promoter_change_4q"] == -2.1
 assert o["pledged_pct"] == 3.5 and o["fii_pct"] == 11.4 and o["dii_pct"] == 9.4
-assert o["inst_change_1q"] == round((11.4 + 9.4) - (11.0 + 9.2), 2)
+assert o["fii_change_1q"] == 0.4 and o["dii_change_1q"] == 0.2 and "inst_change_1q" not in o   # FII and DII are separate
+assert o["fii_change_4q"] == round(11.4 - 10.4, 2) and o["dii_change_4q"] == round(9.4 - 8.6, 2)
 o2 = ownership.compute([], [], m)                      # NSE down: falls back to screener.in table
 assert o2["promoter_pct"] == 54.9 and o2["pledged_pct"] is None and o2["ownership_src"].startswith("screener.in")
 o3 = ownership.compute(sh, [], dict(m, pledged_pct_screener=7.5))       # NSE pledge empty -> screener.in ratio
 assert o3["pledged_pct"] == 7.5 and "screener.in pledge" in o3["ownership_src"]
-print("ownership ok:", {k: o[k] for k in ("promoter_pct", "promoter_decline_streak", "pledged_pct", "inst_change_1q")})
+print("ownership ok:", {k: o[k] for k in ("promoter_pct", "promoter_decline_streak", "pledged_pct", "fii_change_1q", "dii_change_1q")})
 
 # ------------------------------------------------------------------ end to end: fundamentals.get_metrics with mocked network
 si._http_get = lambda url: R(200, page())
@@ -213,7 +268,7 @@ fund.configure(provider="screener", growth_years=5, use_nse=True, fallback=True)
 met, note = fund.get_metrics("TEST")
 assert met["source"] == "screener.in" and met["sales_growth_basis"] == "5Y CAGR" and met["promoter_pct"] == 54.9
 res = fund.evaluate(met, "Capital Goods", fund.FundamentalFilters(), None)
-assert "promoter_holding" in res["passed"] and "pledging" in res["passed"] and "institutional_trend" in res["passed"]
+assert "promoter_holding" in res["passed"] and "pledging" in res["passed"] and "fii_trend" in res["passed"] and "dii_trend" in res["passed"]
 assert "promoter_trend" in res["failed"], res            # fell 3 quarters in a row
 fund.configure(growth_years=10)
 met10, _ = fund.get_metrics("TEST")                       # served from cache, growth re-picked

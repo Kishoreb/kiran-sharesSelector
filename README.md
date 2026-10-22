@@ -22,6 +22,10 @@ candidate_engine.py      CANDIDATE ENGINE — screens + ranks a universe, today
 backtester.py             BACKTESTER — historical simulation + metrics
 monitor.py                 POSITION MONITOR — is an open position still valid
 screener.py                  CLI — wires it all together (screen / backtest / monitor / update-price)
+meta_model.py                 META-LABELING — optional calibrated win-probability filter (train-meta / --meta)
+anomaly.py                      financial anomaly scan (cash flow vs profit, debtor days, other income, ...)
+gov_classifier.py              optional classifier that lowers likely false-positive governance flags
+qualitative.py                  news sentiment (lexicon / FinBERT) + governance red-flag scan
 ```
 
 Each module works standalone (import and use in your own scripts) or
@@ -223,6 +227,106 @@ failed or missing fundamentals, volume not confirmed). It is not a
 recommendation. The CSV also gains `fund_passed`, `fund_evaluated`,
 `cond_met` and `cond_missed` columns.
 
+## Optional ML layers (PyTorch / scikit-learn)
+
+Four add-ons sit AROUND the rule-based engine. All are off by default, none changes your entry/stop/target
+rules, and each falls back to the old behaviour if its model or package is missing.
+
+```
+pip install -r requirements-ml.txt        # torch, transformers, scikit-learn (Windows: see pytorch.org for the right torch build)
+```
+
+### 1. FinBERT news sentiment (`qualitative.py`)
+
+Replaces the keyword lexicon with FinBERT (finance-tuned BERT, runs locally). Score = P(positive) - P(negative).
+
+```
+python screener.py screen --index nifty200 --qualitative flag --llm finbert
+python holdings_analysis.py Kiran_2026-06_holdings.xls --llm finbert
+python holdings_analysis.py holdings.xls --llm finbert --llm-model C:\models\finbert    # local copy
+```
+
+The first run downloads `ProsusAI/finbert` (about 440 MB) from Hugging Face; for an offline machine download
+it once and pass the folder with `--llm-model`. If the model cannot load, a warning is printed and the lexicon is
+used. Headline sentiment stays noisy: it is a prompt to read the listed headlines, not a signal on its own.
+
+### 2. Governance-flag classifier (`gov_classifier.py`)
+
+The regexes still find red flags. A small text classifier gives a second opinion on each hit and **lowers the
+severity one step** (High -> Medium -> Low) when it is confident the hit is a false positive. It never removes
+or raises a flag; every flag keeps `ml_prob` and `ml_note`.
+
+```
+python gov_classifier.py train                           # seed set + governance_labels.csv, TF-IDF + logistic regression
+python gov_classifier.py train --embedder ProsusAI/finbert   # PyTorch embeddings instead of TF-IDF
+python gov_classifier.py predict "Nomura cuts rating on Siemens" --flag rating_downgrade
+python holdings_analysis.py holdings.xls --gov-model gov_model.pkl
+python screener.py screen --index nifty200 --qualitative flag --gov-model gov_model.pkl
+```
+
+Improving it: open the **Governance flags** sheet of `*_analysis.xlsx`, fill the `label` column (1 = genuine,
+0 = false positive), then `python gov_classifier.py import-sheet Kiran_2026-06_holdings_analysis.xlsx` and train again.
+`train` prints a cross-validation report, including how many genuine flags would have been wrongly demoted.
+The built-in seed set (about 40 rows) is only a demo; aim for 100+ reviewed rows before relying on it.
+
+### 3. Meta-labeling trade-quality filter (`meta_model.py`, `train-meta`)
+
+The strategy still decides whether a setup exists. A gradient-boosting model (scikit-learn
+`HistGradientBoostingClassifier`) then estimates how likely that setup is to end as a winner, from point-in-time
+features only: stop distance, ATR %, 5/20/63-day returns, relative strength vs index, volume ratio, distance from
+EMAs / 200-SMA / 52-week high, EMA slope, close position in the day's range, traded value, index trend and return,
+signal score, strategy type. Fundamentals, market cap and news are **not** used (live snapshots would leak the future).
+
+```
+python screener.py train-meta --index nifty200 --strategy pullback_trend --period 5y
+python screener.py train-meta --index nifty500 --strategy breakout --period 5y --dataset-out meta_rows.csv
+python screener.py screen --index nifty200 --strategy pullback_trend --meta flag
+python screener.py screen --index nifty200 --strategy pullback_trend --meta filter --meta-min-prob 0.45
+```
+
+`train-meta` runs the backtest with capital, position-count and heat limits lifted (so every signal becomes a
+training row), builds features on the signal day, then validates **walk-forward**: each fold trains only on trades
+that had already closed before the test window, and scores the next unseen window. It prints out-of-sample AUC,
+plain rules vs "keep the top 70 / 50 / 30%", how many folds improved, and a plain-words verdict. The model file
+(`meta_model.pkl`) is written either way; **only use `--meta` if the verdict supports it.** One model per strategy.
+
+In `screen`, `--meta flag` adds `meta_prob` to the CSV and thesis and ranks by it after points (before relative
+strength); `--meta filter` also drops candidates below `--meta-min-prob` (default: the cut-off stored in the model).
+Retrain periodically (for example monthly) so the model sees recent trades.
+
+`train-meta` also calibrates the probabilities: the model is fitted on the earlier part of the training trades and an
+isotonic (200+ rows) or Platt/sigmoid (40-199 rows) calibrator on the later part, so "min prob 0.5" means roughly
+"half of such setups won". With too few rows it says `none` (raw probabilities). The report adds Brier scores
+(raw vs calibrated vs always guessing the base rate) and a reliability table (5 buckets, predicted vs actual win
+rate, out-of-sample). If the table is far from the diagonal, do not trust the probabilities as numbers.
+
+Limits: survivorship bias (today's index list, or use `--membership-file`) is in the training data; a few hundred
+trades is a small sample; the filter is only as good as its out-of-sample table; and a model trained in one market
+regime may fail in another. Offline tests: `python test_ml.py`.
+
+### 4. Financial anomaly detection (`anomaly.py`)
+
+Looks at the numbers themselves (screener.in annual statements, now including the cash-flow table) for patterns
+that often accompany trouble. Seven transparent rules, each showing the numbers behind it: 3-year operating cash
+flow under 50% of net profit; negative operating cash flow despite profit; debtor days or inventory days up 30%+
+(and 10+ days) vs the previous 3-year average; other income 40%+ of PBT (or +20 pts); borrowings CAGR 15%+ and 20+ pts
+above sales CAGR; operating margin moving 8+ pts vs its 3-year average. With 8+ companies in the run it also flags
+robust-z-score outliers vs peers, and with 30+ it adds an Isolation Forest score (`anomaly_iso_pct`).
+Level: **High** = 2+ rule flags; **Watch** = 1 rule flag, a peer outlier, or top-5% Isolation Forest; **None**;
+**n/a** = no usable statements, or a bank/NBFC (these ratios do not apply). Missing data is never a flag.
+
+```
+python anomaly.py POLYCAB VMART TITAN
+python holdings_analysis.py Kiran_2026-06_holdings.xls              # anomaly scan is on; --skip-anomalies to turn off
+python screener.py screen --index nifty200 --anomalies flag         # annotate (CSV columns, thesis "Watch:" line)
+python screener.py screen --index nifty200 --anomalies filter       # also drop level High
+```
+
+Limits: screen-only (latest annual statements, not point-in-time, never in the backtester); in `screen` only the
+candidates are analysed, so the peer layers usually do not run there (rules do); capex phases, acquisitions and
+one-off income trigger the rules legitimately. A flag is a reason to read the filings, not a verdict. The first run
+after this update re-fetches screener.in pages (cache version bumped) to read the cash-flow table.
+
 ## Shared options (both screen and backtest)
 
 
@@ -280,3 +384,6 @@ it up automatically via `--strategy your_name`.
 | `backtest_trades.csv` | `backtest` — every simulated trade |
 | `backtest_equity.csv` | `backtest` — day-by-day equity curve |
 | `.cache/*.csv` | `universe.py` — cached NSE index lists (1 day) |
+| `meta_model.pkl`, `meta_rows.csv` | `train-meta` — trained filter, optional training rows |
+| `*_analysis.xlsx` columns `anomaly_level`, `anomaly_flags` | `holdings_analysis.py` — financial anomaly scan |
+| `gov_model.pkl`, `governance_labels.csv` | `gov_classifier.py` — classifier and your reviewed flag labels |

@@ -17,6 +17,11 @@ Honest limits:
     and link so you can verify it. News-sourced flags are lower confidence than NSE filings.
   * Live data: results are a snapshot, so this is screen-only (never used in the backtester).
   * Network code could not be tested against the live feeds from the sandbox.
+
+Optional ML layers (both fall back silently to the rule-based behaviour if unavailable):
+  * FinBertScorer  - local FinBERT sentiment instead of the keyword lexicon (--llm finbert).
+  * gov_model      - gov_classifier.GovModel: second opinion on regex red flags; lowers the severity of likely
+                     false positives one step, never removes or raises a flag (--gov-model gov_model.pkl).
 """
 
 import csv
@@ -110,8 +115,9 @@ def scan_text(text: str, tokens=None, source: str = "nse"):
     return list(hit.values())
 
 
-def scan_items(items, source, tokens=None):
-    """items: [{'text'|'title', 'date', 'link'}] -> list of flag dicts (deduplicated)."""
+def scan_items(items, source, tokens=None, gov_model=None):
+    """items: [{'text'|'title', 'date', 'link'}] -> list of flag dicts (deduplicated).
+    gov_model (gov_classifier.GovModel): optional second opinion; adds ml_prob and may lower a severity one step."""
     seen, flags = set(), []
     for it in items:
         text = it.get("text") or it.get("title") or ""
@@ -122,8 +128,11 @@ def scan_items(items, source, tokens=None):
             seen.add(key)
             if source == "news" and sev == "High":
                 sev = "Medium"                      # a headline alone is unverified; only NSE filings count as High
-            flags.append({"flag": name, "severity": sev, "source": source, "date": str(it.get("date") or ""),
-                          "text": text[:200], "link": it.get("link") or ""})
+            f = {"flag": name, "severity": sev, "source": source, "date": str(it.get("date") or ""),
+                 "text": text[:200], "link": it.get("link") or ""}
+            if gov_model is not None:
+                gov_model.apply(f, text)
+            flags.append(f)
     return flags
 
 
@@ -248,6 +257,79 @@ class LLMScorer:
         return out
 
 
+# ---------------------------------------------------------------- FinBERT scorer (PyTorch, local)
+class FinBertScorer:
+    """Scores headlines with FinBERT (finance-tuned BERT) running locally: score = P(positive) - P(negative),
+    -1..+1, same contract as LLMScorer. Needs `pip install torch transformers`. The model is downloaded once from
+    Hugging Face (ProsusAI/finbert) or loaded from a local folder (--llm-model C:\\models\\finbert). If it cannot be
+    loaded, score() returns None for every headline and the caller falls back to the lexicon."""
+
+    def __init__(self, model=None, batch=32, max_len=128):
+        self.model_id = model or os.environ.get("FINBERT_MODEL", "ProsusAI/finbert")
+        self.batch, self.max_len = batch, max_len
+        self.name = "finbert:" + (os.path.basename(self.model_id.rstrip("/\\")) or self.model_id)
+        self.error, self._ready = None, False
+
+    @staticmethod
+    def score_from_probs(probs, pos_idx, neg_idx):
+        return round(float(probs[pos_idx] - probs[neg_idx]), 3)
+
+    def _load(self):
+        if self._ready:
+            return
+        import torch
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        self._torch = torch
+        self._tok = AutoTokenizer.from_pretrained(self.model_id)
+        self._mdl = AutoModelForSequenceClassification.from_pretrained(self.model_id).eval()
+        labels = {int(i): str(l).lower() for i, l in self._mdl.config.id2label.items()}
+        self._pos = next(i for i, l in labels.items() if l.startswith("pos"))
+        self._neg = next(i for i, l in labels.items() if l.startswith("neg"))
+        self._dev = "cuda" if torch.cuda.is_available() else "cpu"
+        self._mdl.to(self._dev)
+        self._ready = True
+
+    def score(self, company, headlines):
+        if not headlines:
+            return []
+        try:
+            self._load()
+        except Exception as e:
+            if self.error is None:
+                self.error = f"{type(e).__name__}: {e}"[:200]
+                print(f"  [warning] FinBERT unavailable ({self.error}); using the keyword lexicon instead")
+            return [None] * len(headlines)
+        out = []
+        for i in range(0, len(headlines), self.batch):
+            chunk = headlines[i:i + self.batch]
+            try:
+                enc = self._tok(chunk, padding=True, truncation=True, max_length=self.max_len, return_tensors="pt")
+                enc = {k: v.to(self._dev) for k, v in enc.items()}
+                with self._torch.no_grad():
+                    probs = self._torch.softmax(self._mdl(**enc).logits, dim=-1).cpu().numpy()
+                out += [self.score_from_probs(p, self._pos, self._neg) for p in probs]
+            except Exception:
+                out += [None] * len(chunk)
+        return out
+
+
+def make_scorer(kind, model=None, url=None):
+    """'none' -> None (lexicon); 'finbert' -> FinBertScorer; 'ollama' / 'anthropic' -> LLMScorer."""
+    if kind in (None, "none"):
+        return None
+    if kind == "finbert":
+        return FinBertScorer(model)
+    return LLMScorer(kind, model, url)
+
+
+def load_gov_model(path):
+    """Optional governance false-positive classifier trained by gov_classifier.py. None if no path is given."""
+    if not path:
+        return None
+    import gov_classifier
+    return gov_classifier.GovModel.load(path)
+
+
 # ---------------------------------------------------------------- news
 def clean_company_name(name: str) -> str:
     """'ABB INDIALIMITED' -> 'ABB INDIA'; 'AMBUJA CEMENTS LIMITED- NEW EQUITY SHARES...' -> 'AMBUJA CEMENTS'.
@@ -353,8 +435,8 @@ def _cache_file(symbol, tag):
     return os.path.join(CACHE_DIR, f"{symbol.upper().replace('&', '_')}_{tag}.json")
 
 
-def analyse(symbol: str, name: str = None, days: int = 90, scorer: LLMScorer = None,
-            use_news: bool = True, use_announcements: bool = True) -> dict:
+def analyse(symbol: str, name: str = None, days: int = 90, scorer=None,
+            use_news: bool = True, use_announcements: bool = True, gov_model=None) -> dict:
     """
     Never raises. Returns a flat dict ready for a table row:
       news_n_30d, sentiment_30d, sentiment_prev, sentiment_trend, sentiment_label, scorer,
@@ -362,7 +444,7 @@ def analyse(symbol: str, name: str = None, days: int = 90, scorer: LLMScorer = N
       top_negative (headline text), q_notes (what could not be fetched).
     """
     name = name or symbol
-    tag = hashlib.md5(f"v{PATTERN_VERSION}|{days}|{use_news}|{use_announcements}|{scorer.name if scorer else 'lexicon'}".encode()).hexdigest()[:8]
+    tag = hashlib.md5(f"v{PATTERN_VERSION}|{days}|{use_news}|{use_announcements}|{scorer.name if scorer else 'lexicon'}|{gov_model.name if gov_model else 'regex'}".encode()).hexdigest()[:8]
     path = _cache_file(symbol, tag)
     if not FORCE_REFRESH and os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_TTL:
         try:
@@ -394,14 +476,14 @@ def analyse(symbol: str, name: str = None, days: int = 90, scorer: LLMScorer = N
             head = clean_company_name(name).lower().split(" ")[0]
             tokens = [t for t in {head, symbol.lower()} if len(t) >= 3]
             flags += scan_items([{"title": i["title"], "date": i["date"].date(), "link": i["link"]} for i in items],
-                                "news", tokens)
+                                "news", tokens, gov_model)
         except Exception as e:
             notes.append(f"news: {type(e).__name__}: {e}"[:160])
     if use_announcements:
         try:
             import nse_client
             ann = nse_client.announcements(symbol, days)
-            flags = scan_items(ann, "NSE") + flags               # NSE filings first: higher confidence
+            flags = scan_items(ann, "NSE", None, gov_model) + flags               # NSE filings first: higher confidence
         except Exception as e:
             notes.append(f"NSE announcements: {type(e).__name__}: {e}"[:160])
 

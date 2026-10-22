@@ -14,6 +14,8 @@ Design rules:
   * Missing data is "n/a", never a silent pass or fail. By default n/a does
     not reject a stock (Yahoo coverage of Indian small/mid caps has gaps);
     use strict=True to reject on any n/a.
+  * P/E vs industry uses the INDUSTRY P/E of the company's own peer group (screener.in's peer-comparison
+    median), or a value from industry_pe.csv if you maintain one. Not a median over the screened index.
   * Banks / NBFCs ("Financial Services" industry) are exempt from ROCE,
     debt-to-equity and interest coverage, which don't mean the same thing
     for lenders.
@@ -21,9 +23,9 @@ Design rules:
     and "ROE average" is over however many (up to 5) are available.
 """
 
+import csv
 import json
 import os
-import statistics
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -46,7 +48,7 @@ GROWTH_YEARS = 5             # horizon for the sales / PAT growth rules: 3, 5 or
 USE_NSE = True               # fetch promoter holding / pledging from NSE
 FALLBACK_YAHOO = True        # if the primary source fails for a symbol, use Yahoo instead
 FORCE_REFRESH = False        # ignore every cache (statements, NSE, news)
-METRICS_VERSION = 2          # bump when metrics change shape; older cache files are recomputed
+METRICS_VERSION = 3          # bump when metrics change shape; older cache files are recomputed
 
 
 def configure(provider=None, growth_years=None, use_nse=None, fallback=None, debug_dir=None, refresh=None):
@@ -75,10 +77,10 @@ def configure(provider=None, growth_years=None, use_nse=None, fallback=None, deb
 
 FINANCIAL_KEYWORD = "financ"          # matches NSE industry "Financial Services"
 FINANCIAL_EXEMPT_RULES = {"roce", "de", "icr"}
-MIN_PEERS_FOR_INDUSTRY_PE = 5
+INDUSTRY_PE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "industry_pe.csv")
 
 ALL_RULES = ["roce", "roe", "de", "icr", "sales_growth", "pat_growth", "pe_vs_industry", "peg",
-             "promoter_holding", "promoter_trend", "pledging", "institutional_trend"]
+             "promoter_holding", "promoter_trend", "pledging", "fii_trend", "dii_trend"]
 
 
 @dataclass
@@ -94,7 +96,8 @@ class FundamentalFilters:
     min_promoter: float = 50.0        # % promoter holding (rule n/a for companies with ~no promoter)
     max_pledge: float = 5.0           # % of promoter shares pledged
     promoter_decline_quarters: int = 3   # fail if promoter holding fell in each of this many latest quarters
-    min_inst_change: float = 0.0      # pp change in FII+DII holding over the latest quarter
+    min_fii_change: float = 0.0       # pp change in FII holding over the latest quarter (rule fails below this)
+    min_dii_change: float = 0.0       # pp change in DII holding over the latest quarter (rule fails below this)
     skip: set = field(default_factory=set)   # rule names to disable, from ALL_RULES
     strict: bool = False              # True: any n/a rejects the stock
 
@@ -296,40 +299,36 @@ def get_metrics(symbol: str) -> Tuple[Optional[dict], str]:
     return metrics, note
 
 
-def get_pe(symbol: str) -> Optional[float]:
-    """Cached trailing P/E only (used to build industry medians)."""
-    cache = _load(symbol)
-    if _fresh(cache.get("pe_ts")):
-        return cache.get("pe")
-    pe = None
-    if PROVIDER == "screener":
-        try:
-            import screener_in
-            from screener_in import num
-            pe = num(screener_in.get_raw(symbol)["top"].get("Stock P/E"))
-        except Exception:
-            pe = None
-    if pe is None and yf is not None:
-        pe = _fetch_info_pe(yf.Ticker(to_yf_symbol(symbol)))
-    cache.update({"pe": pe, "pe_ts": time.time()})
-    _save(symbol, cache)
-    return pe
+def load_industry_pe_overrides(path: str = None) -> Dict[str, float]:
+    """
+    Optional file YOU maintain, one industry per line:   industry,pe
+        Capital Goods,42.5
+    Matched case-insensitively against the NSE industry name of the company. When present it takes
+    precedence over screener.in's peer median. Missing file = no overrides (not an error).
+    """
+    path = path or INDUSTRY_PE_FILE
+    out: Dict[str, float] = {}
+    if not os.path.exists(path):
+        return out
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.reader(f):
+            if len(row) < 2 or not row[0].strip() or row[0].strip().startswith("#"):
+                continue
+            if row[0].strip().lower() == "industry":
+                continue
+            try:
+                pe = float(row[1].split("#")[0].strip())
+            except ValueError:
+                continue
+            if pe > 0:
+                out[row[0].strip().lower()] = pe
+    return out
 
 
-def industry_pe_map(symbols: List[str], sector_map: Dict[str, str], progress: bool = True) -> Dict[str, Tuple[float, int]]:
-    """industry -> (median positive P/E, peer count). Industries with < MIN_PEERS are omitted."""
-    by_industry: Dict[str, List[float]] = {}
-    for idx, sym in enumerate(symbols, 1):
-        industry = sector_map.get(sym.upper())
-        if not industry or industry == "Unknown":
-            continue
-        if progress and idx % 25 == 0:
-            print(f"  industry P/E: {idx}/{len(symbols)}")
-        pe = get_pe(sym)
-        if pe:
-            by_industry.setdefault(industry, []).append(pe)
-    return {ind: (statistics.median(v), len(v)) for ind, v in by_industry.items()
-            if len(v) >= MIN_PEERS_FOR_INDUSTRY_PE}
+def override_for(overrides: Optional[Dict[str, float]], industry: str):
+    """(pe, 0, 'industry_pe file') for this industry, or None."""
+    pe = (overrides or {}).get((industry or "").strip().lower())
+    return (pe, 0, "industry_pe file") if pe else None
 
 
 # --------------------------------------------------------------------------
@@ -340,9 +339,11 @@ def _status(value, ok) -> str:
 
 
 def evaluate(metrics: Optional[dict], industry: str, cfg: FundamentalFilters,
-             industry_pe: Optional[Tuple[float, int]] = None) -> dict:
+             industry_pe: Optional[tuple] = None) -> dict:
     """
-    Returns {"status": pass|fail|n/a, "failed": [...], "unknown": [...], "exempt": [...]}.
+    industry_pe: optional (pe, n_peers[, source]) that overrides the industry P/E carried in `metrics`
+    (screener.in's peer median). With neither, the P/E-vs-industry rule is n/a.
+    Returns {"status": pass|fail|n/a, "failed": [...], "unknown": [...], "exempt": [...], "industry_pe": ...}.
     status 'fail' = at least one rule failed (or, in strict mode, any rule is n/a).
     status 'n/a'  = nothing could be evaluated at all.
     """
@@ -352,9 +353,12 @@ def evaluate(metrics: Optional[dict], industry: str, cfg: FundamentalFilters,
 
     is_financial = FINANCIAL_KEYWORD in (industry or "").lower()
     pe = metrics.get("pe")
-    pe_vs = None
-    if pe is not None and industry_pe:
-        pe_vs = pe  # evaluated against median below
+    ipe = industry_pe
+    ipe_src = (ipe[2] if ipe and len(ipe) > 2 else "override") if ipe else None
+    if not ipe and metrics.get("industry_pe"):
+        ipe = (metrics["industry_pe"], metrics.get("industry_pe_n") or 0)
+        ipe_src = metrics.get("industry_pe_src") or "screener.in peer median"
+    pe_vs = pe if (pe is not None and ipe) else None
 
     # widely-held companies (no promoter, ~0%) cannot be judged on promoter rules: those rules are n/a
     prom = metrics.get("promoter_pct")
@@ -367,15 +371,15 @@ def evaluate(metrics: Optional[dict], industry: str, cfg: FundamentalFilters,
         "icr": _status(metrics.get("icr"), lambda v: v >= cfg.min_icr),
         "sales_growth": _status(metrics.get("sales_growth"), lambda v: v >= cfg.min_sales_growth),
         "pat_growth": _status(metrics.get("pat_growth"), lambda v: v >= cfg.min_pat_growth),
-        "pe_vs_industry": (_status(pe_vs, lambda v: v <= industry_pe[0] * cfg.pe_tolerance)
-                           if industry_pe else "n/a"),
+        "pe_vs_industry": (_status(pe_vs, lambda v: v <= ipe[0] * cfg.pe_tolerance) if ipe else "n/a"),
         "peg": _status(metrics.get("peg"), lambda v: v < cfg.max_peg),
         "promoter_holding": _status(prom_known, lambda v: v >= cfg.min_promoter),
         "promoter_trend": _status(metrics.get("promoter_decline_streak") if prom_known is not None else None,
                                   lambda v: v < cfg.promoter_decline_quarters),
         "pledging": _status(metrics.get("pledged_pct") if prom_known is not None else None,
                             lambda v: v <= cfg.max_pledge),
-        "institutional_trend": _status(metrics.get("inst_change_1q"), lambda v: v >= cfg.min_inst_change),
+        "fii_trend": _status(metrics.get("fii_change_1q"), lambda v: v >= cfg.min_fii_change),
+        "dii_trend": _status(metrics.get("dii_change_1q"), lambda v: v >= cfg.min_dii_change),
     }
 
     failed, passed, unknown, exempt, evaluated = [], [], [], [], 0
@@ -402,4 +406,5 @@ def evaluate(metrics: Optional[dict], industry: str, cfg: FundamentalFilters,
     else:
         status = "pass"
     return {"status": status, "failed": failed, "passed": passed, "evaluated": evaluated,
-            "unknown": unknown, "exempt": exempt}
+            "unknown": unknown, "exempt": exempt,
+            "industry_pe": ipe[0] if ipe else None, "industry_pe_src": ipe_src}

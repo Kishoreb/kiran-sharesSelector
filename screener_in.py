@@ -31,7 +31,7 @@ CACHE_MAX_AGE = 7 * 24 * 3600
 MIN_DELAY = 1.5
 DEBUG_DIR = None
 FORCE_REFRESH = False        # bypass the on-disk cache (set by --refresh-cache / --debug-dump)
-RAW_VERSION = 2              # bump when the parsed layout changes; older cache files are re-fetched
+RAW_VERSION = 3              # bump when the parsed layout changes; older cache files are re-fetched
 ALT_MIN_YEARS = 9            # fewer annual columns than this -> also read the standalone page
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -161,13 +161,15 @@ _LABEL_RULES = {                       # fallback when a table is not inside the
     "bs": lambda L: "reserves" in L and ("borrowings" in L or "deposits" in L),
     "ratios": lambda L: "roce %" in L or "debtor days" in L,
     "holding": lambda L: "promoters" in L and "public" in L,
+    "cf": lambda L: any(x.startswith("cash from operating") for x in L),
 }
 
 
 def parse_page(html: str) -> dict:
     p = _Page()
     p.feed(html)
-    raw = {"top": {k: v for k, v in p.top}, "ranges": {}, "pl": None, "bs": None, "ratios": None, "holding": None}
+    raw = {"top": {k: v for k, v in p.top}, "ranges": {}, "pl": None, "bs": None, "ratios": None, "holding": None,
+           "cf": None}
 
     def grid(head, body):
         cols = [clean_label(c) for c in head[1:]]
@@ -194,7 +196,7 @@ def parse_page(html: str) -> dict:
             g = grid(head, body)
             wide.append((t, g))
             key = {"profit-loss": "pl", "balance-sheet": "bs", "ratios": "ratios",
-                   "shareholding": "holding"}.get(t["section"])
+                   "shareholding": "holding", "cash-flow": "cf"}.get(t["section"])
             if key and raw[key] is None:                   # first table per section = annual / quarterly
                 raw[key] = g
     for key, rule in _LABEL_RULES.items():                 # fallback by row labels, never from quarters/peers
