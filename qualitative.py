@@ -17,11 +17,6 @@ Honest limits:
     and link so you can verify it. News-sourced flags are lower confidence than NSE filings.
   * Live data: results are a snapshot, so this is screen-only (never used in the backtester).
   * Network code could not be tested against the live feeds from the sandbox.
-
-Optional ML layers (both fall back silently to the rule-based behaviour if unavailable):
-  * FinBertScorer  - local FinBERT sentiment instead of the keyword lexicon (--llm finbert).
-  * gov_model      - gov_classifier.GovModel: second opinion on regex red flags; lowers the severity of likely
-                     false positives one step, never removes or raises a flag (--gov-model gov_model.pkl).
 """
 
 import csv

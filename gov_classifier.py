@@ -41,7 +41,6 @@ MIN_PER_CLASS = 8
 SEVERITY_DOWN = {"High": "Medium", "Medium": "Low", "Low": "Low"}
 
 # (flag, text, label)   label 1 = genuine concern for that flag type, 0 = false positive.
-# Several are verbatim cases seen in real runs (see test_sources.py); the rest are typical phrasings.
 SEED = [
     ("auditor_resignation", "Intimation: the Company has received the resignation of M/s XYZ & Co as its statutory auditors", 1),
     ("auditor_resignation", "Auditor resigns citing lack of information", 1),
@@ -253,14 +252,13 @@ def train(labels_path=DEFAULT_LABELS, out=DEFAULT_MODEL, embedder_id=None, use_s
     cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=0)
     p = cross_val_predict(est, X, y, cv=cv, method="predict_proba")[:, 1]
     demoted = p < DEMOTE_BELOW
-    fp_total, real_total = n0, n1
     fp_caught = int((demoted & (y == 0)).sum())
     real_hurt = int((demoted & (y == 1)).sum())
     report = {"rows": len(rows), "genuine": n1, "false_positive": n0, "cv_folds": folds,
-              "cv_auc": round(float(roc_auc_score(y, p)), 3), "fp_caught": fp_caught, "fp_total": fp_total,
-              "real_demoted": real_hurt, "real_total": real_total}
+              "cv_auc": round(float(roc_auc_score(y, p)), 3), "fp_caught": fp_caught, "fp_total": n0,
+              "real_demoted": real_hurt, "real_total": n1}
     log(f"Cross-validated ({folds}-fold) AUC {report['cv_auc']}. At the demotion cut-off {DEMOTE_BELOW}: "
-        f"{fp_caught} of {fp_total} false positives caught; {real_hurt} of {real_total} genuine flags wrongly demoted.")
+        f"{fp_caught} of {n0} false positives caught; {real_hurt} of {n1} genuine flags wrongly demoted.")
     if len(rows) < 100:
         log("  Warning: fewer than 100 labelled rows - treat this model as a demo and add reviewed rows "
             "(see 'import-sheet').")
