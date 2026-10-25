@@ -1,6 +1,6 @@
 """
-Offline test of `screener.py screen` wiring (no network): fundamentals + qualitative are ON by default,
-fundamental_weights.csv is read, --technical-only switches both off, new CSV columns are written.
+Offline test of `screener.py screen` wiring (no network): fundamentals + qualitative are OFF by default and
+switched on with --fundamentals / --qualitative, --weights-file is optional, the new CSV columns are written.
 
     python test_screen_enrich.py
 """
@@ -63,6 +63,9 @@ def fake_qual(sym, name=None, **kw):
 fund.get_metrics, qual.analyse = fake_metrics, fake_qual
 
 
+ON = ["--fundamentals", "flag", "--qualitative", "flag"]
+
+
 def run(*extra, weights=None):
     out = os.path.join(TMP, "out.csv")
     argv = ["screener.py", "screen", "--symbols", "AAA", "--max-stop-pct", "0", "--out", out, *extra]
@@ -77,9 +80,9 @@ def run(*extra, weights=None):
     return pd.read_csv(out, keep_default_na=False), buf.getvalue()
 
 
-# ---- default: both layers ON, weights file read
+# ---- both layers switched on, weights file read
 W = "rule,weight\npat_growth,2\npeg,0\nsales_growth,1\n"
-df, text = run(weights=W)
+df, text = run(*ON, weights=W)
 row = df[df.symbol == "AAA"].iloc[0]
 assert calls["fund"] == 1 and calls["qual"] == 1, calls
 assert row.fund_status == "fail"                                    # dii_trend failed (DII fell)
@@ -96,38 +99,38 @@ for col, want in (("industry_pe", 25.0), ("sales_growth_pct", 12.0), ("pat_growt
                   ("dii_change_1q", -0.3), ("sentiment_30d", 0.4)):
     assert float(row[col]) == want, (col, row[col])
 assert row.sentiment_label == "Positive" and "mgmt_exit" in row.qual_flags and "FII 11.4% (+0.50 pp)" in row.thesis, row.thesis
-print("default screen ok: fundamentals + qualitative ran, weights applied, new columns written")
+print("screen ok: fundamentals + qualitative ran, weights applied, new columns written")
 
 # ---- weights drive the ranking points
 cand = candidate_engine.Candidate("X", "s", 5, 8, 100, 95, 110, 1, 100, 5, "", fund_status="pass", fund_passed=3, fund_passed_w=7.0)
 assert candidate_engine.CandidateEngine.points(cand, 1.0) == 12.0 and candidate_engine.CandidateEngine.points(cand, 0) == 5
 print("ranking ok: points use passed weight")
 
-# ---- --no-weights-file: every rule weighs 1, peg evaluated (and fails)
-df, text = run("--no-weights-file", weights=None)
+# ---- no weights file: every rule weighs 1, peg evaluated (and fails)
+df, text = run(*ON)
 row = df[df.symbol == "AAA"].iloc[0]
 assert float(row.fund_evaluated) == 13 and "peg" in row.fund_notes and row.fund_score == "11/13", (row.fund_evaluated, row.fund_notes, row.fund_score)
-print("--no-weights-file ok")
+print("no weights file ok")
 
 # ---- industry P/E override file beats the page value (P/E 20 vs industry 10 x 1.1 -> fails)
 ov = os.path.join(TMP, "ipe.csv")
 open(ov, "w").write("industry,pe\nUnknown,10\n")
-df, text = run("--industry-pe-file", ov, "--no-weights-file")
+df, text = run(*ON, "--industry-pe-file", ov)
 assert "pe_vs_industry" in df[df.symbol == "AAA"].iloc[0].fund_notes and float(df[df.symbol == "AAA"].iloc[0].industry_pe) == 10.0
 print("industry P/E override ok")
 
-# ---- each layer can be switched off alone, and --technical-only switches both off
+# ---- each layer works alone, and with no flags both stay off (the default)
 calls.update(fund=0, qual=0)
-df, _ = run("--qualitative", "off", "--no-weights-file")
+df, _ = run("--fundamentals", "flag")
 assert calls == {"fund": 1, "qual": 0} and df[df.symbol == "AAA"].iloc[0].fund_status != "" and df[df.symbol == "AAA"].iloc[0].sentiment_label == ""
 calls.update(fund=0, qual=0)
-df, _ = run("--fundamentals", "off", "--no-weights-file")
+df, _ = run("--qualitative", "flag")
 assert calls == {"fund": 0, "qual": 1} and df[df.symbol == "AAA"].iloc[0].fund_status == ""
 calls.update(fund=0, qual=0)
-df, text = run("--technical-only")
+df, text = run()
 r = df[df.symbol == "AAA"].iloc[0]
 assert calls == {"fund": 0, "qual": 0} and r.fund_status == "" and r.sentiment_label == "" and r.fund_score == "", calls
-print("switches ok: --fundamentals off, --qualitative off, --technical-only")
+print("switches ok: each layer alone, both off by default")
 
 # ---- update-price still works on the wider CSV (every existing column preserved)
 screener.fetch_history = lambda sym, period="5d", interval="1d": DF

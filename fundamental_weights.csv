@@ -1,7 +1,6 @@
 # Fundamental rule weights. One rule per line: rule,weight
 # weight 0 skips the rule; any positive number counts it (2 = twice as important as 1).
 # Thresholds themselves are command-line options (--min-roce, --max-de, ...).
-# Used by `screener.py screen` and holdings_analysis.py.
 rule,weight
 roce,1   # ROCE >= --min-roce
 roe,1   # average ROE >= --min-roe

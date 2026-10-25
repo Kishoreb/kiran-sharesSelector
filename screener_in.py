@@ -31,7 +31,7 @@ CACHE_MAX_AGE = 7 * 24 * 3600
 MIN_DELAY = 1.5
 DEBUG_DIR = None
 FORCE_REFRESH = False        # bypass the on-disk cache (set by --refresh-cache / --debug-dump)
-RAW_VERSION = 3              # bump when the parsed layout changes; older cache files are re-fetched
+RAW_VERSION = 4              # bump when the parsed layout changes; older cache files are re-fetched
 ALT_MIN_YEARS = 9            # fewer annual columns than this -> also read the standalone page
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -169,7 +169,7 @@ def parse_page(html: str) -> dict:
     p = _Page()
     p.feed(html)
     raw = {"top": {k: v for k, v in p.top}, "ranges": {}, "pl": None, "bs": None, "ratios": None, "holding": None,
-           "cf": None}
+           "cf": None, "warehouse_id": warehouse_id(html)}
 
     def grid(head, body):
         cols = [clean_label(c) for c in head[1:]]
@@ -230,11 +230,11 @@ def _http_get(url):
     return requests.get(url, headers=HEADERS, timeout=20)
 
 
-def _get_with_retry(url, tries=3):
+def _get_with_retry(url, tries=3, getter=None):
     last = None
     for k in range(tries):
         try:
-            return _http_get(url)
+            return (getter or _http_get)(url)
         except requests.RequestException as e:          # DNS blips, resets, timeouts
             last = e
             time.sleep(2 * (k + 1))
@@ -421,4 +421,85 @@ def metrics_from_raw(raw: dict, growth_years: int = 5) -> dict:
         for key, label in (("promoters", "promoters"), ("fiis", "fiis"), ("diis", "diis")):
             r = _row(h, label)
             out[f"hold_{key}"] = [[c, v] for c, v in zip(h["cols"], r or []) if v is not None]
+    return out
+
+
+# ---------------------------------------------------------------- industry P/E from the page's peer table
+MIN_PEERS = 5
+PEERS_URL = "https://www.screener.in/api/company/{wid}/peers/"
+_WID_RES = (re.compile(r"/api/company/(\d+)/peers"), re.compile(r"data-warehouse-id\s*=\s*[\"']?(\d+)"))
+
+
+def warehouse_id(html: str):
+    """The numeric id screener.in uses for the peers request, or None if the page does not carry one."""
+    for rx in _WID_RES:
+        m = rx.search(html or "")
+        if m:
+            return m.group(1)
+    return None
+
+
+def _http_get_peers(url):
+    wait = MIN_DELAY - (time.time() - _last_request[0])
+    if wait > 0:
+        time.sleep(wait)
+    _last_request[0] = time.time()
+    h = dict(HEADERS, **{"X-Requested-With": "XMLHttpRequest", "Referer": "https://www.screener.in/"})
+    return requests.get(url, headers=h, timeout=20)
+
+
+def parse_peers(html: str) -> dict:
+    """{'pes': [positive P/E of each peer row], 'listed_median': the site's own 'Median' row value or None}."""
+    p = _Page()
+    p.feed(html or "")
+    for t in p.tables:
+        head, body = _header_and_body(t)
+        if len(head) <= 2 and t["all"]:
+            head, body = t["all"][0], t["all"][1:]
+        idx = next((i for i, c in enumerate(head) if re.match(r"\s*p\s*/\s*e\b", clean_label(c), re.I)), None)
+        if idx is None:
+            continue
+        pes, listed = [], None
+        for r in body:
+            if len(r) <= idx:
+                continue
+            v = num(r[idx])
+            if any(re.search(r"median|average", clean_label(c), re.I) for c in r[:3]):
+                listed = v if v and v > 0 else listed
+            elif v is not None and v > 0:
+                pes.append(v)
+        return {"pes": pes, "listed_median": listed}
+    return {"pes": [], "listed_median": None}
+
+
+def get_industry_pe(symbol: str, refresh: bool = False) -> dict:
+    """Median trailing P/E of the company's screener.in peers (its own industry group), cached 7 days.
+    Returns {'industry_pe', 'industry_pe_n', 'industry_pe_src'}. Raises RuntimeError with the reason when it cannot
+    be found, so callers show 'n/a' instead of guessing."""
+    import statistics
+    path = os.path.join(CACHE_DIR, f"{symbol.strip().upper().replace('/', '_')}_peers.json")
+    if not (refresh or FORCE_REFRESH) and os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_MAX_AGE:
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    wid = get_raw(symbol).get("warehouse_id")
+    if not wid:
+        raise RuntimeError("peer table id not found on the screener.in page (layout changed? use --debug-dump)")
+    r = _get_with_retry(PEERS_URL.format(wid=wid), getter=_http_get_peers)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code} from the screener.in peers request")
+    if DEBUG_DIR:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        with open(os.path.join(DEBUG_DIR, f"screener_peers_{symbol.upper()}.html"), "w", encoding="utf-8") as f:
+            f.write(r.text)
+    pes = parse_peers(r.text)["pes"]
+    if len(pes) < MIN_PEERS:
+        raise RuntimeError(f"only {len(pes)} peers with a P/E in the screener.in peer table (need {MIN_PEERS}+)")
+    out = {"industry_pe": round(statistics.median(pes), 2), "industry_pe_n": len(pes),
+           "industry_pe_src": f"screener.in peers (median of {len(pes)})"}
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(out, f)
     return out

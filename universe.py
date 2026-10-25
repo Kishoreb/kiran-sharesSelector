@@ -13,6 +13,7 @@ as a last resort.
 import csv
 import io
 import os
+import re
 import time
 from datetime import date, datetime
 
@@ -137,6 +138,8 @@ def get_index_constituents(index_name: str, refresh: bool = False, use_cache_on_
     Same fetch/cache/fallback behaviour as get_index_symbols.
     """
     index_name = index_name.lower()
+    if index_name == ALL_INDEX:
+        return get_all_constituents(refresh)
     if index_name not in INDEX_URLS:
         raise ValueError(f"Unknown index '{index_name}'. Choose from: {list(INDEX_URLS)}")
 
@@ -174,3 +177,118 @@ def get_index_symbols(index_name: str, refresh: bool = False, use_cache_on_failu
     Falls back to the last successful cache if the live fetch fails.
     """
     return [row["symbol"] for row in get_index_constituents(index_name, refresh, use_cache_on_failure)]
+
+
+# ---------------------------------------------------------------- the whole NSE market ("all")
+ALL_INDEX = "all"
+ALL_MIN_TURNOVER_CR = 0.5        # pre-filter: last-day traded value in Rs crore (0 = keep every EQ-series stock); set by screener.py
+EQUITY_LIST_URL = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
+BHAV_URL = "https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{d}.csv"
+_FIN_NAME_RE = re.compile(r"FINANCE|FINANCIAL|BANK|HOUSING FIN|ASSET MANAGEMENT|AMC", re.I)
+
+
+def _norm_row(row):
+    return {(k or "").strip().upper(): (v or "").strip() for k, v in row.items()}
+
+
+def get_equity_list(refresh: bool = False):
+    """[{'symbol','name'}] for every EQ-series stock in NSE's official list (cached 7 days; stale cache if offline)."""
+    path = os.path.join(CACHE_DIR, "equity_l.csv")
+    text = None
+    if not refresh and os.path.exists(path) and time.time() - os.path.getmtime(path) < 7 * 86400:
+        text = open(path, encoding="utf-8").read()
+    else:
+        try:
+            r = requests.get(EQUITY_LIST_URL, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            text = r.text
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        except Exception as e:
+            if os.path.exists(path):
+                print(f"  [warning] live fetch of the NSE equity list failed ({e}); using the last cached copy")
+                text = open(path, encoding="utf-8").read()
+            else:
+                raise RuntimeError(f"Could not fetch NSE's equity list ({e}) and no cached copy exists.")
+    out = []
+    for row in csv.DictReader(io.StringIO(text)):
+        row = _norm_row(row)
+        if row.get("SYMBOL") and row.get("SERIES", "EQ").upper() == "EQ":
+            out.append({"symbol": row["SYMBOL"].upper(), "name": row.get("NAME OF COMPANY", "")})
+    if not out:
+        raise RuntimeError("NSE equity list had no EQ-series rows (format may have changed)")
+    return out
+
+
+def parse_bhavcopy(text: str) -> dict:
+    """{symbol: traded value in Rs crore} for EQ-series rows of NSE's sec_bhavdata_full file (TURNOVER_LACS / 100)."""
+    out = {}
+    for row in csv.DictReader(io.StringIO(text)):
+        row = _norm_row(row)
+        if row.get("SERIES", "").upper() != "EQ" or not row.get("SYMBOL"):
+            continue
+        key = next((k for k in row if "TURNOVER" in k), None)
+        try:
+            out[row["SYMBOL"].upper()] = float(row[key].replace(",", "")) / 100.0
+        except (TypeError, ValueError, KeyError, AttributeError):
+            continue
+    return out
+
+
+def get_turnover_cr(refresh: bool = False, max_back: int = 7, today: date = None):
+    """(turnover map, bhavcopy date) from the latest NSE bhavcopy that exists, walking back over weekends and
+    holidays (each day's file is cached). Raises RuntimeError if none of the last `max_back` days is available."""
+    from datetime import timedelta
+    today = today or date.today()
+    last = None
+    for k in range(max_back + 1):
+        d = today - timedelta(days=k)
+        if d.weekday() >= 5:
+            continue
+        path = os.path.join(CACHE_DIR, f"bhav_{d:%Y%m%d}.csv")
+        text = None
+        if not refresh and os.path.exists(path):
+            text = open(path, encoding="utf-8").read()
+        else:
+            try:
+                r = requests.get(BHAV_URL.format(d=f"{d:%d%m%Y}"), headers=HEADERS, timeout=30)
+                if r.status_code == 200 and "SYMBOL" in r.text[:500].upper():
+                    text = r.text
+                    os.makedirs(CACHE_DIR, exist_ok=True)
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(text)
+                else:
+                    last = f"HTTP {r.status_code} for {d}"
+            except Exception as e:
+                last = str(e)
+        if text:
+            m = parse_bhavcopy(text)
+            if m:
+                return m, d
+            last = f"bhavcopy for {d} had no usable rows"
+    raise RuntimeError(f"No NSE bhavcopy found for the last {max_back} days ({last}). "
+                       f"Pass --universe-min-turnover-cr 0 to skip the liquidity pre-filter.")
+
+
+def get_all_constituents(refresh: bool = False, min_turnover_cr: float = None):
+    """Every EQ-series NSE stock whose last-day traded value is at least `min_turnover_cr` (a cheap pre-filter so you
+    do not download price history for thousands of dead stocks; the strategy's own 20-day liquidity filter still applies).
+    Industry comes from the Nifty 500 list where the stock is in it; otherwise 'Unknown', or
+    'Financial Services (guessed)' when the company name looks like a lender (so bank-style rule exemptions apply)."""
+    cr = ALL_MIN_TURNOVER_CR if min_turnover_cr is None else min_turnover_cr
+    eq = get_equity_list(refresh)
+    kept = eq
+    if cr > 0:
+        turn, d = get_turnover_cr(refresh)
+        kept = [e for e in eq if turn.get(e["symbol"], 0.0) >= cr]
+        print(f"  Universe 'all': {len(eq)} EQ-series stocks, {len(kept)} with traded value >= Rs {cr} Cr on {d}.")
+    else:
+        print(f"  Universe 'all': {len(eq)} EQ-series stocks (no liquidity pre-filter).")
+    try:
+        ind = {c["symbol"].upper(): c["industry"] for c in get_index_constituents("nifty500", refresh)}
+    except Exception:
+        ind = {}
+    return [{"symbol": e["symbol"],
+             "industry": ind.get(e["symbol"]) or ("Financial Services (guessed)" if _FIN_NAME_RE.search(e["name"]) else "Unknown")}
+            for e in kept]

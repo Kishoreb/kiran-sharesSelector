@@ -223,8 +223,9 @@ def analyse(h, strategies, sector_map, fcfg, args, weights=None, ind_pe=None):
 
     if fcfg is not None:
         m, err = fund.get_metrics(h["symbol"])
-        res = fund.evaluate(m, sector, fcfg, (ind_pe or {}).get(sector))
+        res = fund.evaluate(m, sector, fcfg, fund.override_for(ind_pe, sector))
         sc = fw.score(res, weights)
+        r["industry_pe"], r["industry_pe_src"] = res.get("industry_pe"), res.get("industry_pe_src")
         r["fund_score"] = sc["text"]                  # passed weight / evaluated weight, e.g. "5/7"
         r["fund_score_pct"] = sc["pct"]
         r["fund_tier"] = fw.tier(sc["pct"], args.fund_strong, args.fund_weak)
@@ -246,7 +247,7 @@ def analyse(h, strategies, sector_map, fcfg, args, weights=None, ind_pe=None):
                              ("pledged_pct", "pledged_pct"), ("pledged_change_1q", "pledged_change_1q"),
                              ("pledged_pct_total", "pledged_pct_total"),
                              ("pledge_src", "pledge_src"), ("pledge_asof", "pledge_asof"), ("fii_pct", "fii_pct"), ("dii_pct", "dii_pct"),
-                             ("inst_change_1q", "inst_change_1q"), ("ownership_notes", "ownership_notes"),
+                             ("fii_change_1q", "fii_change_1q"), ("dii_change_1q", "dii_change_1q"), ("ownership_notes", "ownership_notes"),
                              ("statements", "statements"), ("growth_from_standalone", "growth_from_standalone"), ("sales_cagr_5y", "sales_cagr_5y"), ("sales_cagr_10y", "sales_cagr_10y"),
                              ("pat_cagr_5y", "pat_cagr_5y"), ("pat_cagr_10y", "pat_cagr_10y")):
                 r[k_out] = m.get(k)
@@ -260,8 +261,9 @@ def analyse(h, strategies, sector_map, fcfg, args, weights=None, ind_pe=None):
         if names is None:
             names = args._names = qual.symbol_name_map()
         q = qual.analyse(h["symbol"], names.get(h["symbol"].upper(), h["name"]), days=args.news_days,
-                         scorer=getattr(args, "scorer", None), gov_model=getattr(args, "gov", None))
-        for k in ("news_n_30d", "sentiment_30d", "sentiment_trend", "sentiment_label", "flag_severity",
+                         scorer=getattr(args, "scorer", None), gov_model=getattr(args, "gov", None),
+                         deduper=getattr(args, "deduper", None))
+        for k in ("news_n_30d", "news_dupes_removed", "sentiment_30d", "sentiment_trend", "sentiment_label", "flag_severity",
                   "flag_text", "top_negative", "q_notes"):
             r[k] = q.get(k)
         r["_flags"] = q.get("flags") or []
@@ -297,13 +299,11 @@ def build(args):
     fcfg, ind_pe = None, {}
     if not args.skip_fundamentals:
         skip = fw.skip_set(weights)
-        if not args.industry_pe:
-            skip = skip | {"pe_vs_industry"}
         fcfg = fund.FundamentalFilters(skip=skip, min_promoter=args.min_promoter, max_pledge=args.max_pledge)
         print("Fundamental rule weights: " + ", ".join(f"{k}={v:g}" for k, v in weights.items()))
-        if args.industry_pe and sector_map:
-            print(f"Building industry P/E medians from {len(sector_map)} {args.index} symbols (cached 7 days)...")
-            ind_pe = fund.industry_pe_map(list(sector_map), sector_map)
+        ind_pe = fund.load_industry_pe_overrides(args.industry_pe_file)
+        if ind_pe:
+            print(f"Industry P/E overrides loaded for {len(ind_pe)} industries.")
 
     rows, skipped = [], []
     for k, h in enumerate(holdings, 1):
@@ -393,8 +393,8 @@ def main():
     ap.add_argument("--skip-fundamentals", action="store_true", dest="skip_fundamentals")
     ap.add_argument("--weights-file", dest="weights_file", default=None,
                     help="CSV of 'rule,weight' (default: fundamental_weights.csv next to this script; 0 skips a rule)")
-    ap.add_argument("--industry-pe", action="store_true", dest="industry_pe",
-                    help="also score P/E vs industry median (fetches P/E for the whole --index universe; slow once, cached)")
+    ap.add_argument("--industry-pe-file", dest="industry_pe_file", default=None,
+                    help="CSV 'industry,pe' you maintain; beats the screener.in peer median (default: industry_pe.csv if present)")
     ap.add_argument("--fund-strong", type=float, default=75.0, dest="fund_strong", help="score %% at/above which fundamentals are 'Strong'")
     ap.add_argument("--fund-weak", type=float, default=50.0, dest="fund_weak", help="score %% below which fundamentals are 'Weak'")
     ap.add_argument("--skip-marketcap", action="store_true", dest="skip_marketcap")
@@ -415,6 +415,10 @@ def main():
     ap.add_argument("--ollama-url", dest="ollama_url", default=None)
     ap.add_argument("--gov-model", dest="gov_model", default=None,
                     help="governance false-positive classifier (gov_model.pkl from gov_classifier.py train)")
+    ap.add_argument("--dedup", choices=["none", "lexical", "embed"], default="none",
+                    help="drop near-duplicate headlines before scoring sentiment (embed = local sentence-embedding model)")
+    ap.add_argument("--dedup-model", dest="dedup_model", default=None,
+                    help="embedding model for --dedup embed (HF id or local folder; default all-MiniLM-L6-v2)")
     ap.add_argument("--refresh-cache", action="store_true", dest="refresh_cache",
                     help="ignore cached screener.in / NSE / news results and fetch everything fresh (--debug-dump implies this)")
     ap.add_argument("--debug-dump", dest="debug_dump", default=None,
@@ -432,6 +436,7 @@ def main():
                    fallback=not args.no_yahoo_fallback, debug_dir=args.debug_dump, refresh=args.refresh_cache)
     args.scorer = qual.make_scorer(args.llm, args.llm_model, args.ollama_url)
     args.gov = qual.load_gov_model(args.gov_model)
+    args.deduper = qual.make_deduper(args.dedup, args.dedup_model)
     rows, skipped = build(args)
     if not rows:
         sys.exit("Nothing could be analysed.")

@@ -296,6 +296,12 @@ def get_metrics(symbol: str) -> Tuple[Optional[dict], str]:
         metrics.update(ownership.get(symbol, metrics, USE_NSE))
     except Exception as e:
         metrics["ownership_notes"] = f"ownership failed: {e}"[:160]
+    if metrics.get("source") == "screener.in":          # industry P/E = median P/E of the company's screener.in peers
+        try:
+            import screener_in
+            metrics.update(screener_in.get_industry_pe(symbol))
+        except Exception as e:
+            note = (note + " | " if note else "") + f"industry P/E: {e}"[:160]
     return metrics, note
 
 

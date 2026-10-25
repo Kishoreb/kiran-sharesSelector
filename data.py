@@ -4,6 +4,8 @@ backtester) goes through here so there's one place that talks to Yahoo
 Finance and one place to fix things if the data source changes.
 """
 
+import time
+
 import pandas as pd
 
 try:
@@ -47,8 +49,14 @@ def fetch_history(symbol: str, period: str = "2y", interval: str = "1d") -> pd.D
         raise ImportError("yfinance not installed. Run: pip install -r requirements.txt")
 
     yf_symbol = to_yf_symbol(symbol)
-    df = yf.Ticker(yf_symbol).history(period=period, interval=interval, auto_adjust=True)
-    if df.empty:
+    df = None
+    for attempt in (1, 2):                       # one retry: Yahoo sometimes answers empty on a first request
+        df = yf.Ticker(yf_symbol).history(period=period, interval=interval, auto_adjust=True)
+        if df is not None and not df.empty:
+            break
+        if attempt == 1:
+            time.sleep(1.0)
+    if df is None or df.empty:
         raise ValueError(f"no price data returned for {yf_symbol}")
 
     return add_indicators(df)

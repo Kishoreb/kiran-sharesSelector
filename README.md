@@ -13,29 +13,50 @@ lists; neither is reachable from a sandboxed environment.
 ## Architecture
 
 ```
-data.py               Fetches OHLCV + indicators from Yahoo Finance
-fundamentals.py        Yahoo annual-statement ratios + rule checks (screen only)
-universe.py            Fetches live NIFTY index constituent lists from NSE
-strategies.py           STRATEGY ENGINE — pullback_trend, breakout, pluggable
-risk.py                 RISK ENGINE — position sizing, targets, portfolio heat
-candidate_engine.py      CANDIDATE ENGINE — screens + ranks a universe, today
-backtester.py             BACKTESTER — historical simulation + metrics
-monitor.py                 POSITION MONITOR — is an open position still valid
-screener.py                  CLI — wires it all together (screen / backtest / monitor / update-price)
-meta_model.py                 META-LABELING — optional calibrated win-probability filter (train-meta / --meta)
-anomaly.py                      financial anomaly scan (cash flow vs profit, debtor days, other income, ...)
-gov_classifier.py              optional classifier that lowers likely false-positive governance flags
-qualitative.py                  news sentiment (lexicon / FinBERT) + governance red-flag scan
+data.py                 Fetches OHLCV + indicators from Yahoo Finance
+universe.py             Live NIFTY index lists from NSE + dated snapshots
+membership.py           Point-in-time index membership (cuts survivorship bias)
+strategies.py           STRATEGY ENGINE - pullback_trend, breakout, pluggable; section-3 technical filters
+risk.py                 RISK ENGINE - position sizing, targets, portfolio heat
+costs.py                Delivery charges (STT, stamp, GST, DP) + slippage
+filters.py              Pre-trade filters: liquidity, stop width, results calendar
+market.py               Benchmark regime filter + relative strength
+exits.py                Breakeven / swing-low trailing stop and time-stop (shared by backtester and monitor)
+candidate_engine.py     CANDIDATE ENGINE - screens + ranks a universe, today
+backtester.py           BACKTESTER - gap-aware simulation, next-open fills, costs
+validation.py           in/out-of-sample, year/regime, sweeps, walk-forward, Monte Carlo, ablation
+report.py               Self-contained HTML validation report
+real_data_check.py      One-command real-data run of `validate` for both strategies
+monitor.py              POSITION MONITOR - is an open position still valid
+fundamentals.py         Section-1 rule checks (screen only); fund_weights.py + fundamental_weights.csv = rule weights
+screener_in.py          screener.in statements (up to 10y), FII/DII table
+nse_client.py           NSE shareholding, pledge (incl. XBRL), announcements
+ownership.py            Promoter / pledge / FII-DII metrics and quarter-on-quarter changes
+qualitative.py          News sentiment (lexicon / FinBERT / LLM) + governance red-flag scan
+news_dedup.py          Optional near-duplicate headline removal (word overlap or local sentence embeddings)
+gov_classifier.py       Optional classifier that lowers likely false-positive governance flags
+anomaly.py              Financial anomaly scan (cash flow vs profit, debtor days, other income, ...)
+meta_model.py          META-LABELING - optional calibrated win-probability filter (train-meta / --meta)
+cdsl_holdings_to_xls.py CDSL CAS PDF -> holdings .xls and mutual fund -MF.XLS (see HoldingToExcel.md)
+holdings_analysis.py    Runs the rules over YOUR holdings -> *_analysis.xlsx
+screener.py             CLI: screen / backtest / validate / monitor / update-price / train-meta / snapshot-changes
+diagnose_dump.py, fetch_xbrl_sample.py   Diagnostics for --debug-dump folders and NSE XBRL tags
+test_toolkit.py, test_sources.py, test_validation.py, test_membership.py, test_ml.py, test_dedup.py, test_universe.py   Offline tests
 ```
 
 Each module works standalone (import and use in your own scripts) or
-through the CLI.
+through the CLI. Other commands: `validate` (stress-test a backtest), `train-meta`,
+`snapshot-changes`; holdings analysis runs through `holdings_analysis.py`.
 
 ## Setup (one time)
 
 ```
 pip install -r requirements.txt
 ```
+
+`requirements.txt` holds everything. `torch` and `transformers` are needed only for FinBERT and the
+embedding classifier; on Windows install the right `torch` build from pytorch.org first.
+Python 3.9+; `pytesseract` also needs the Tesseract program, and only for scanned CAS PDFs.
 
 ## Screening — what meets your rules today
 
@@ -185,13 +206,16 @@ the ones that fail. Default is `off`.
 | Interest coverage (`icr`) | >= 3x | EBIT / interest expense (no interest cost = infinite) |
 | Sales growth (`sales_growth`) | >= 10% | 3Y CAGR if 4 years exist, else YoY |
 | PAT growth (`pat_growth`) | >= 12% | 3Y CAGR if 4 years exist, else YoY |
-| P/E vs industry (`pe_vs_industry`) | <= industry median x 1.10 | Median trailing P/E of NSE-Industry peers in the screened universe (needs >= 5 peers) |
+| P/E vs industry (`pe_vs_industry`) | <= industry P/E x 1.10 | Median P/E of the company's own peer table on screener.in (needs 5+ peers), fetched per candidate and cached 7 days. An `industry_pe.csv` (`industry,pe` per line, `--industry-pe-file`) overrides it. n/a if the peer table cannot be read |
+| FII trend (`fii_trend`) | FII holding did not fall | Change over the latest quarter, `--min-fii-change` |
+| DII trend (`dii_trend`) | DII holding did not fall | Change over the latest quarter, `--min-dii-change`; FII and DII are separate rules |
 | PEG (`peg`) | < 1.0 | P/E / PAT growth %, only when both are positive |
 
 How missing data is handled:
 - **n/a is not a pass.** A rule Yahoo can't supply shows as n/a in `fund_notes`. By default n/a does not reject a stock; `--strict-fundamentals` makes it a fail.
 - **Banks / NBFCs** (industry containing "Financial") are exempt from ROCE, D/E and interest coverage and shown as `exempt`. Use `--index` so sector info exists.
-- **P/E vs industry** builds peer medians by fetching P/E for the whole universe on the first run (slow for nifty500), then caches for 7 days under `.cache/fundamentals/`. Skip it with `--skip-rules pe_vs_industry`.
+- **P/E vs industry** uses the median of the company's own screener.in peer table (not a median over the screened universe); `industry_pe.csv` is an optional override. The peer request is untested against the live site: if a run shows `data: industry P/E: ...`, use `--debug-dump` and send the `screener_peers_*.html` file. Skip the rule with `--skip-rules pe_vs_industry`.
+- **Rule weights (optional).** `--weights-file fundamental_weights.csv` weighs the rules (0 skips one); without it every rule counts 1. The CSV gains `fund_passed_w`, `fund_evaluated_w`, `fund_score`, `fund_tier`, `industry_pe`, `sales_growth_pct`, `pat_growth_pct`, `promoter_change_1q`, `pledged_change_1q`, `fii_pct`, `fii_change_1q`, `dii_pct`, `dii_change_1q`, `sentiment_label`.
 - **PEG < 1** is strict; expect it to reject most stocks. Try it with `--skip-rules peg` to see how much it matters.
 
 Limitations: these are the latest annual statements, not point-in-time, so
@@ -233,7 +257,7 @@ Four add-ons sit AROUND the rule-based engine. All are off by default, none chan
 rules, and each falls back to the old behaviour if its model or package is missing.
 
 ```
-pip install -r requirements-ml.txt        # torch, transformers, scikit-learn (Windows: see pytorch.org for the right torch build)
+pip install -r requirements.txt           # includes torch, transformers, scikit-learn (Windows: see pytorch.org for the right torch build)
 ```
 
 ### 1. FinBERT news sentiment (`qualitative.py`)
@@ -249,6 +273,22 @@ python holdings_analysis.py holdings.xls --llm finbert --llm-model C:\models\fin
 The first run downloads `ProsusAI/finbert` (about 440 MB) from Hugging Face; for an offline machine download
 it once and pass the folder with `--llm-model`. If the model cannot load, a warning is printed and the lexicon is
 used. Headline sentiment stays noisy: it is a prompt to read the listed headlines, not a signal on its own.
+
+### 1b. News de-duplication (`news_dedup.py`)
+
+Google News returns the same story many times, which inflates the headline count and lets one story dominate the
+sentiment average. `--dedup` keeps one headline per cluster of near-duplicates (newest kept) before scoring.
+
+```
+python screener.py screen --index nifty200 --qualitative flag --dedup lexical     # word overlap, no extra packages
+python screener.py screen --index nifty200 --qualitative flag --dedup embed       # local sentence embeddings
+python holdings_analysis.py holdings.xls --dedup embed --dedup-model C:\models\minilm
+```
+
+Only headlines within 3 days of an already-kept similar one are dropped, so a story that returns weeks later
+still counts. `embed` loads `sentence-transformers/all-MiniLM-L6-v2` (about 90 MB, via `transformers`, needs
+torch); if it cannot load, it warns and falls back to word overlap. The result gains `news_dupes_removed`.
+Default is `none` (old behaviour). Offline tests: `python test_dedup.py`.
 
 ### 2. Governance-flag classifier (`gov_classifier.py`)
 
@@ -327,12 +367,38 @@ candidates are analysed, so the peer layers usually do not run there (rules do);
 one-off income trigger the rules legitimately. A flag is a reason to read the filings, not a verdict. The first run
 after this update re-fetches screener.in pages (cache version bumped) to read the cash-flow table.
 
+## Whole-market universe (`--index all`)
+
+```
+python screener.py screen --index all                                  # every EQ-series NSE stock with last-day traded value >= Rs 0.5 Cr
+python screener.py screen --index all --universe-min-turnover-cr 2     # stricter pre-filter
+python screener.py screen --index all --universe-min-turnover-cr 0     # no pre-filter (thousands of symbols: very slow)
+python screener.py screen --index all --cap-class small --max-from-high-pct 15
+```
+
+The list comes from NSE's `EQUITY_L.csv` (EQ series only, so trade-for-trade BE stocks are dropped) and the latest
+daily bhavcopy (`sec_bhavdata_full`), which gives every stock's traded value in one file, so illiquid names are
+removed BEFORE any price history is downloaded. The pre-filter uses ONE day's traded value as a cheap first cut;
+the strategy's own 20-day liquidity rule (`--min-turnover-cr`) still applies afterwards. If no bhavcopy is
+found for the last 7 days the run stops with a message instead of silently using an unfiltered list.
+
+Sector: taken from the Nifty 500 list where the stock is in it; otherwise `Unknown`, or `Financial Services (guessed)`
+when the company name looks like a lender (so the bank-style rule exemptions apply). Stocks outside the Nifty 500
+therefore have no industry P/E and are not counted in the sector-cap check. Guessed names are left out of the
+industry P/E medians.
+
+Limits: today's list only (survivorship bias; `--membership-file` is ignored with `--index all`), and market cap is
+still Yahoo's live snapshot, so use `--cap-class small|mid|large` to pick the band. A full-market run downloads
+price history per symbol, so expect it to take much longer than Nifty 200; `screen` is the sensible use. Untested
+against the live NSE files (offline tests only): if the bhavcopy columns or URL change, `parse_bhavcopy` and
+`BHAV_URL` in `universe.py` are the two places to fix.
+
 ## Shared options (both screen and backtest)
 
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--index` | `nifty50` | `nifty50` / `niftynext50` / `nifty100` / `nifty200` / `nifty500`, fetched live from NSE |
+| `--index` | `nifty50` | `nifty50` / `niftynext50` / `nifty100` / `nifty200` / `nifty500` / `all`, fetched live from NSE |
 | `--symbols` | — | Explicit symbol list, overrides `--index` |
 | `--file` | — | Text file of symbols, overrides `--index` |
 | `--strategy` | `pullback_trend` | `pullback_trend` or `breakout` |
@@ -364,12 +430,20 @@ it up automatically via `--strategy your_name`.
   Backtesting 3 years back still uses today's NIFTY 500, not what was in the
   index 3 years ago — stocks that were removed (often because they performed
   badly) are invisible to the backtest. This inflates results.
-- **No brokerage, STT, or taxes** are deducted in the backtest. Real returns
-  would be lower, especially with many small trades.
-- **No slippage** — fills assume you get exactly the signalled price.
+- **Costs are estimates.** Statutory charges (STT, exchange, SEBI, stamp duty, GST, DP charge) and 0.10%
+  slippage per market fill are deducted (`costs.py`; `--no-costs` switches them off). The rates are best
+  estimates: check them against a contract note from your broker. **Capital-gains tax is not modelled.**
+- **Fills are idealised**: next-open entries, gap-aware stops, no circuit-limit or liquidity-depth modelling,
+  daily bars only.
 - **Same-day stop/target conflict**: if both the stop and target would have
   been hit on the same day, the backtester conservatively assumes the stop
   hit first. Real outcomes could go either way.
+- **Fundamentals, ownership, news and anomaly checks are live snapshots**, so they are screen-only and never
+  used in the backtester or as ML features.
+- **Parsers are untested against live sites.** The NSE, screener.in and Google News code and the FinBERT
+  download were only tested offline; use `--debug-dump` on a real run if a field comes back empty.
+- **ML layers are aids.** The governance classifier's seed set is a demo (aim for 100+ reviewed labels); use
+  `--meta` only if the `train-meta` verdict supports it.
 - **Data quality**: Yahoo Finance data for NSE stocks can have gaps or
   occasional errors. Spot-check surprising results against a real chart.
 - This is a rule-checking and simulation tool, not investment advice, and a
@@ -385,5 +459,7 @@ it up automatically via `--strategy your_name`.
 | `backtest_equity.csv` | `backtest` — day-by-day equity curve |
 | `.cache/*.csv` | `universe.py` — cached NSE index lists (1 day) |
 | `meta_model.pkl`, `meta_rows.csv` | `train-meta` — trained filter, optional training rows |
-| `*_analysis.xlsx` columns `anomaly_level`, `anomaly_flags` | `holdings_analysis.py` — financial anomaly scan |
+| `*_analysis.xlsx` | `holdings_analysis.py` — Summary, Holdings analysis, Not analysed, Governance flags sheets (incl. anomaly columns) |
+| `validation_report_*.html`, `validation_sweep_*.csv` | `validate --report / --sweep-out`, `real_data_check.py` |
+| `index_changes.csv` | `snapshot-changes` — input for `--membership-file` |
 | `gov_model.pkl`, `governance_labels.csv` | `gov_classifier.py` — classifier and your reviewed flag labels |

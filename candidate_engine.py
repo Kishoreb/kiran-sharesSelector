@@ -43,6 +43,19 @@ class Candidate:
     peg: Optional[float] = None
     fund_passed: int = 0           # fundamental rules passed (n/a and exempt rules are NOT counted)
     fund_evaluated: int = 0        # fundamental rules actually evaluated
+    fund_passed_w: float = 0.0     # same, summed by rule weight (all weights 1 unless --weights-file is given)
+    fund_evaluated_w: float = 0.0
+    fund_score: str = ""           # passed weight / evaluated weight, e.g. "11/13"
+    fund_tier: str = ""            # Strong / Mixed / Weak / n/a
+    industry_pe: Optional[float] = None    # industry P/E the P/E rule used (screener.in peer median or industry_pe.csv)
+    sales_growth_pct: Optional[float] = None
+    pat_growth_pct: Optional[float] = None
+    promoter_change_1q: Optional[float] = None    # pp, latest quarter
+    pledged_change_1q: Optional[float] = None     # pp, only for consecutive-quarter XBRL filings
+    fii_pct: Optional[float] = None
+    fii_change_1q: Optional[float] = None         # pp; FII and DII are judged separately
+    dii_pct: Optional[float] = None
+    dii_change_1q: Optional[float] = None
     cond_met: str = ""             # strategy/technical conditions that were true
     cond_missed: str = ""          # conditions that were false (non-gating ones, e.g. volume)
     over_sector_cap: bool = False
@@ -55,6 +68,7 @@ class Candidate:
     pledged_pct: Optional[float] = None
     sentiment_30d: Optional[float] = None
     sentiment_trend: Optional[float] = None
+    sentiment_label: str = ""            # Positive / Neutral / Negative
     qual_severity: str = ""                # '', 'Medium' or 'High' governance red-flag severity
     qual_flags: str = ""
     anomaly_level: str = ""                # financial anomaly scan: "", "None", "Watch", "High" or "n/a"
@@ -82,6 +96,8 @@ class CandidateEngine:
         self.trade_filters = trade_filters          # same pre-trade filters the backtester applies
         self.results_calendar = results_calendar
         self.skipped: Dict[str, int] = {}           # filter reason -> signals dropped
+        self.no_data: List[str] = []                # symbols whose price download failed
+        self.aborted = False                        # True if the run stopped because Yahoo returned nothing at all
 
     def screen_symbol(self, symbol: str) -> List[Candidate]:
         results = []
@@ -137,8 +153,11 @@ class CandidateEngine:
         except Exception:
             return None
 
+    ABORT_AFTER_FAILURES = 10    # consecutive failed downloads with zero successes -> stop, Yahoo is not answering
+
     def screen_universe(self, symbols: List[str], progress: bool = True) -> List[Candidate]:
         all_candidates = []
+        ok, streak = 0, 0
         for idx, sym in enumerate(symbols, 1):
             if progress:
                 print(f"  [{idx}/{len(symbols)}] {sym}...", end=" ")
@@ -153,18 +172,26 @@ class CandidateEngine:
                 else:
                     print("no signal")
             all_candidates.extend(passed)
+            if errored:
+                self.no_data.append(sym)
+                streak += 1
+                if ok == 0 and streak >= self.ABORT_AFTER_FAILURES:
+                    self.aborted = True
+                    break
+            else:
+                ok, streak = ok + 1, 0
         return all_candidates
 
     @staticmethod
     def points(c: Candidate, fund_weight: float = 1.0) -> float:
         """
         Ranking points = technical conditions true + fund_weight x fundamental
-        rules passed. Fundamentals only count when they were run (fund_status
+        rules passed (summed by rule weight). Fundamentals only count when they were run (fund_status
         set). A rule that is n/a or exempt earns nothing, so missing data
         slightly lowers a stock's rank rather than being treated as a pass.
         With fundamentals off, this is exactly the old technical score.
         """
-        return c.score + (fund_weight * c.fund_passed if c.fund_status else 0)
+        return c.score + (fund_weight * c.fund_passed_w if c.fund_status else 0)
 
     @staticmethod
     def rank(candidates: List[Candidate], fund_weight: float = 1.0) -> List[Candidate]:
@@ -239,6 +266,12 @@ class CandidateEngine:
             if c.pledged_pct is not None:
                 own += f", {c.pledged_pct}% pledged"
             parts.append(own)
+        inst = []
+        for lab, pct, chg in (("FII", c.fii_pct, c.fii_change_1q), ("DII", c.dii_pct, c.dii_change_1q)):
+            if pct is not None:
+                inst.append(f"{lab} {pct}%" + (f" ({chg:+.2f} pp)" if chg is not None else ""))
+        if inst:
+            parts.append(", ".join(inst))
         if c.sentiment_30d is not None:
             tr = f", trend {c.sentiment_trend:+.2f}" if c.sentiment_trend is not None else ""
             parts.append(f"News sentiment (30d) {c.sentiment_30d:+.2f}{tr}")

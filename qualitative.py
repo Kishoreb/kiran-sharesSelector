@@ -317,6 +317,12 @@ def make_scorer(kind, model=None, url=None):
     return LLMScorer(kind, model, url)
 
 
+def make_deduper(kind, model=None):
+    """News de-duplication (news_dedup.py): 'none' -> None, 'lexical' or 'embed'."""
+    import news_dedup
+    return news_dedup.make_deduper(kind, model)
+
+
 def load_gov_model(path):
     """Optional governance false-positive classifier trained by gov_classifier.py. None if no path is given."""
     if not path:
@@ -431,7 +437,7 @@ def _cache_file(symbol, tag):
 
 
 def analyse(symbol: str, name: str = None, days: int = 90, scorer=None,
-            use_news: bool = True, use_announcements: bool = True, gov_model=None) -> dict:
+            use_news: bool = True, use_announcements: bool = True, gov_model=None, deduper=None) -> dict:
     """
     Never raises. Returns a flat dict ready for a table row:
       news_n_30d, sentiment_30d, sentiment_prev, sentiment_trend, sentiment_label, scorer,
@@ -439,7 +445,7 @@ def analyse(symbol: str, name: str = None, days: int = 90, scorer=None,
       top_negative (headline text), q_notes (what could not be fetched).
     """
     name = name or symbol
-    tag = hashlib.md5(f"v{PATTERN_VERSION}|{days}|{use_news}|{use_announcements}|{scorer.name if scorer else 'lexicon'}|{gov_model.name if gov_model else 'regex'}".encode()).hexdigest()[:8]
+    tag = hashlib.md5(f"v{PATTERN_VERSION}|{days}|{use_news}|{use_announcements}|{scorer.name if scorer else 'lexicon'}|{gov_model.name if gov_model else 'regex'}|{deduper.name if deduper else 'nodedup'}".encode()).hexdigest()[:8]
     path = _cache_file(symbol, tag)
     if not FORCE_REFRESH and os.path.exists(path) and time.time() - os.path.getmtime(path) < CACHE_TTL:
         try:
@@ -448,10 +454,12 @@ def analyse(symbol: str, name: str = None, days: int = 90, scorer=None,
         except Exception:
             pass
 
-    notes, items, flags, sent = [], [], [], {}
+    notes, items, flags, sent, n_dupes = [], [], [], {}, 0
     if use_news:
         try:
             items = fetch_news(name, days, symbol=symbol)
+            if deduper is not None and items:
+                items, n_dupes = deduper(items)          # one headline per cluster of near-duplicates
             if not items:
                 notes.append(f"news: no headlines found for '{clean_company_name(name)}'")
             heads = [i["title"] for i in items]
@@ -486,7 +494,7 @@ def analyse(symbol: str, name: str = None, days: int = 90, scorer=None,
     order = sorted(flags, key=lambda f: (-SEVERITY_RANK[f["severity"]], f["source"] != "NSE"))
     res = {**{k: sent.get(k) for k in ("news_n_30d", "news_n_prev", "sentiment_30d", "sentiment_prev",
                                        "sentiment_trend", "sentiment_label", "scorer", "top_negative")},
-           "flag_severity": sev,
+           "news_dupes_removed": n_dupes, "flag_severity": sev,
            "flag_text": "; ".join(f"{f['flag']} [{f['severity']}, {f['source']}, {f['date']}]" for f in order[:4]),
            "flags": order, "q_notes": " | ".join(notes)}
     if not notes:                                               # only cache complete results

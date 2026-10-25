@@ -38,9 +38,11 @@ import sys
 
 import pandas as pd
 
-from universe import get_index_symbols, get_index_constituents, INDEX_URLS, changes_from_snapshots
+import universe
+from universe import get_index_symbols, get_index_constituents, INDEX_URLS, ALL_INDEX, changes_from_snapshots
 from strategies import STRATEGIES, TechnicalFilters
 import fundamentals as fund
+import fund_weights as fw
 import validation as val
 import report as rpt
 import qualitative as qual
@@ -168,6 +170,9 @@ def setup_membership(args, symbols):
     if args.symbols or args.file:
         print("Note: --membership-file only applies with --index; ignoring it.")
         return None, symbols
+    if args.index == ALL_INDEX:
+        print("Note: --membership-file does not apply to --index all (no index history); ignoring it.")
+        return None, symbols
     try:
         history = MembershipHistory.from_file(symbols, args.membership_file)
     except (OSError, ValueError) as e:
@@ -213,23 +218,26 @@ def apply_fundamentals(candidates, args, symbols, sector_map):
         min_sales_growth=args.min_sales_growth, min_pat_growth=args.min_pat_growth, max_peg=args.max_peg,
         skip=set(args.skip_rules or []), strict=args.strict_fundamentals,
         min_promoter=args.min_promoter, max_pledge=args.max_pledge,
-        promoter_decline_quarters=args.promoter_decline_quarters, min_inst_change=args.min_inst_change,
+        promoter_decline_quarters=args.promoter_decline_quarters,
+        min_fii_change=args.min_fii_change, min_dii_change=args.min_dii_change,
     )
-    ind_pe = {}
-    if "pe_vs_industry" not in cfg.skip:
-        if sector_map:
-            print(f"\nBuilding industry P/E medians from {len(symbols)} symbols (cached for 7 days)...")
-            ind_pe = fund.industry_pe_map(symbols, sector_map)
-        else:
-            print("\n(No sector info for manually-specified symbols: P/E vs industry will show as n/a.)")
+    weights = fw.load_weights(args.weights_file) if args.weights_file else {r: 1.0 for r in fund.ALL_RULES}
+    cfg.skip = cfg.skip | fw.skip_set(weights)
+    ind_pe = fund.load_industry_pe_overrides(args.industry_pe_file)
+    if ind_pe:
+        print(f"\nIndustry P/E overrides loaded for {len(ind_pe)} industries.")
 
     print(f"\nFundamental check on {len(candidates)} candidate(s)...")
     kept = []
     for c in candidates:
         m, err = fund.get_metrics(c.symbol)
-        res = fund.evaluate(m, c.sector, cfg, ind_pe.get(c.sector))
+        res = fund.evaluate(m, c.sector, cfg, fund.override_for(ind_pe, c.sector))
         c.fund_status = res["status"]
         c.fund_passed, c.fund_evaluated = len(res["passed"]), res["evaluated"]
+        sc = fw.score(res, weights)
+        c.fund_passed_w, c.fund_evaluated_w = sc["passed"], sc["evaluated"]
+        c.fund_score, c.fund_tier = sc["text"], fw.tier(sc["pct"])
+        c.industry_pe = res.get("industry_pe")
         parts = []
         if res["failed"]:
             parts.append("failed: " + ",".join(res["failed"]))
@@ -244,6 +252,10 @@ def apply_fundamentals(candidates, args, symbols, sector_map):
             c.roce_pct, c.roe_avg_pct = _r(m.get("roce")), _r(m.get("roe_avg"))
             c.debt_equity, c.pe, c.peg = _r(m.get("de"), 2), _r(m.get("pe")), _r(m.get("peg"), 2)
             c.promoter_pct, c.pledged_pct = m.get("promoter_pct"), m.get("pledged_pct")
+            c.sales_growth_pct, c.pat_growth_pct = _r(m.get("sales_growth"), 2), _r(m.get("pat_growth"), 2)
+            c.promoter_change_1q, c.pledged_change_1q = m.get("promoter_change_1q"), m.get("pledged_change_1q")
+            c.fii_pct, c.fii_change_1q = m.get("fii_pct"), m.get("fii_change_1q")
+            c.dii_pct, c.dii_change_1q = m.get("dii_pct"), m.get("dii_change_1q")
         print(f"  {c.symbol:<14} {c.fund_status:<5} {c.fund_notes}")
         if args.fundamentals == "filter" and c.fund_status == "fail":
             continue
@@ -278,12 +290,15 @@ def apply_qualitative(candidates, args):
     Mode 'flag' annotates; 'filter' also drops candidates with a High-severity red flag."""
     scorer = qual.make_scorer(args.llm, args.llm_model, args.ollama_url)
     gov = qual.load_gov_model(args.gov_model)
+    deduper = qual.make_deduper(args.dedup, args.dedup_model)
     names = qual.symbol_name_map()
     print(f"\nNews sentiment and governance scan on {len(candidates)} candidate(s) (last {args.news_days} days)...")
     kept = []
     for c in candidates:
-        q = qual.analyse(c.symbol, names.get(c.symbol, c.symbol), days=args.news_days, scorer=scorer, gov_model=gov)
+        q = qual.analyse(c.symbol, names.get(c.symbol, c.symbol), days=args.news_days, scorer=scorer, gov_model=gov,
+                         deduper=deduper)
         c.sentiment_30d, c.sentiment_trend = q.get("sentiment_30d"), q.get("sentiment_trend")
+        c.sentiment_label = q.get("sentiment_label") or ""
         c.qual_severity, c.qual_flags = q.get("flag_severity") or "", q.get("flag_text") or ""
         s30 = f"{c.sentiment_30d:+.2f}" if c.sentiment_30d is not None else "n/a"
         print(f"  {c.symbol:<14} sentiment {s30:<6} flags: {c.qual_flags or 'none'}"
@@ -333,6 +348,16 @@ def cmd_screen(args):
                              trade_filters=build_trade_filters(args), results_calendar=load_calendar(args), meta=meta)
     print(f"Screening {len(symbols)} symbols with '{strategy.name}'...\n")
     candidates = engine.screen_universe(symbols)
+    if engine.aborted:
+        print(f"\nStopped: the first {engine.ABORT_AFTER_FAILURES} symbols all came back with no price data, so this is a "
+              f"Yahoo Finance / network problem, not 'no candidates'. Try:\n"
+              f"  1. pip install -U yfinance        (old versions stop working when Yahoo changes its site)\n"
+              f"  2. python -c \"import yfinance as yf; print(yf.Ticker('TCS.NS').history(period='5d'))\"\n"
+              f"  3. check VPN / proxy / firewall, wait a few minutes if you were rate-limited, then re-run.")
+        sys.exit(1)
+    if engine.no_data:
+        print(f"\n{len(engine.no_data)} of {len(symbols)} symbols had no price data and were skipped"
+              + (f" (e.g. {', '.join(engine.no_data[:5])})" if engine.no_data else "") + ".")
     if engine.skipped:
         print("\nDropped by pre-trade filters: " +
               ", ".join(f"{REASON_LABELS.get(k, k)}: {n}" for k, n in engine.skipped.items()))
@@ -693,8 +718,12 @@ def cmd_update_price(args):
 
 
 def add_common_args(p):
-    p.add_argument("--index", choices=list(INDEX_URLS), default="nifty50",
-                   help="NSE index to fetch live (default: nifty50)")
+    p.add_argument("--index", choices=list(INDEX_URLS) + [ALL_INDEX], default="nifty50",
+                   help="NSE index to fetch live (default: nifty50); 'all' = every EQ-series NSE stock "
+                        "(liquidity pre-filtered, see --universe-min-turnover-cr)")
+    p.add_argument("--universe-min-turnover-cr", type=float, default=0.5, dest="universe_min_turnover_cr",
+                   help="--index all only: keep stocks whose last-day traded value is at least this many Rs crore "
+                        "(0 keeps every EQ-series stock; thousands of symbols take a long time)")
     p.add_argument("--refresh", action="store_true", help="Force a fresh index download instead of using cache")
     p.add_argument("--symbols", nargs="+", help="Space-separated symbols, overrides --index")
     p.add_argument("--file", help="Text file, one symbol per line, overrides --index")
@@ -785,8 +814,14 @@ def main():
     p_screen.add_argument("--max-pledge", type=float, default=5.0, dest="max_pledge", help="Max %% of promoter shares pledged")
     p_screen.add_argument("--promoter-decline-quarters", type=int, default=3, dest="promoter_decline_quarters",
                           help="Fail the promoter-trend rule if holding fell in each of this many latest quarters")
-    p_screen.add_argument("--min-inst-change", type=float, default=0.0, dest="min_inst_change",
-                          help="Min change (pp) in FII+DII holding over the latest quarter")
+    p_screen.add_argument("--min-fii-change", type=float, default=0.0, dest="min_fii_change",
+                          help="Min change (pp) in FII holding over the latest quarter (FII and DII are separate rules)")
+    p_screen.add_argument("--min-dii-change", type=float, default=0.0, dest="min_dii_change",
+                          help="Min change (pp) in DII holding over the latest quarter")
+    p_screen.add_argument("--weights-file", dest="weights_file", default=None,
+                          help="CSV of 'rule,weight' (see fundamental_weights.csv; 0 skips a rule). Default: every rule weighs 1")
+    p_screen.add_argument("--industry-pe-file", dest="industry_pe_file", default=None,
+                          help="CSV 'industry,pe' you maintain; beats the screener.in peer median (default: industry_pe.csv if present)")
     p_screen.add_argument("--qualitative", choices=["off", "flag", "filter"], default="off",
                           help="Section 4: news sentiment + governance red-flag scan. flag = annotate, "
                                "filter = also drop High-severity red flags")
@@ -797,6 +832,10 @@ def main():
     p_screen.add_argument("--ollama-url", dest="ollama_url", default=None)
     p_screen.add_argument("--gov-model", dest="gov_model", default=None,
                           help="governance false-positive classifier (gov_model.pkl from gov_classifier.py train)")
+    p_screen.add_argument("--dedup", choices=["none", "lexical", "embed"], default="none",
+                          help="drop near-duplicate headlines before scoring sentiment (embed = local sentence-embedding model)")
+    p_screen.add_argument("--dedup-model", dest="dedup_model", default=None,
+                          help="embedding model for --dedup embed (HF id or local folder; default all-MiniLM-L6-v2)")
     p_screen.add_argument("--anomalies", choices=["off", "flag", "filter"], default="off",
                           help="financial anomaly scan (cash flow vs profit, debtor/inventory days, other income, "
                                "borrowings, margin swings): off (default), flag, filter (drop level High)")
@@ -875,6 +914,7 @@ def main():
     p_snap.set_defaults(func=cmd_snapshot_changes)
 
     args = parser.parse_args()
+    universe.ALL_MIN_TURNOVER_CR = getattr(args, "universe_min_turnover_cr", 0.5)
     args.func(args)
 
 
